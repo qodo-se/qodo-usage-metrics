@@ -15,6 +15,16 @@ A PR is **processed** if Qodo reviewed it — it carries at least one
 (for example on each new push); **each PR is counted exactly once** regardless
 of how many Qodo reviews it received.
 
+**Every reviewed PR counts, regardless of state** — open, merged, or closed
+without merging. Qodo reviews a PR when it's opened, so limiting the count to
+merged PRs would undercount usage and, more importantly, the **unique-user**
+headline (a user whose reviewed PRs are all still open would vanish). Pass
+`--merged-only` if you specifically want the merged subset.
+
+The window filters on each PR's **creation date** (every PR has one; unmerged
+PRs have no merge date). So a run counts the PRs *opened* in the window that
+Qodo reviewed.
+
 ## Why it's fast
 
 It relies entirely on GitHub's search index — the `"Code Review by Qodo"
@@ -61,6 +71,9 @@ python3 qodo_usage_metrics.py --org acme-corp --repos frontend-app backend-api
 python3 qodo_usage_metrics.py --org acme-corp --anonymize          # users + repos
 python3 qodo_usage_metrics.py --org acme-corp --anonymize users    # users only
 python3 qodo_usage_metrics.py --org acme-corp --anonymize repos    # repos only
+
+# Count only merged PRs (default counts every reviewed PR, any state)
+python3 qodo_usage_metrics.py --org acme-corp --merged-only
 ```
 
 ### Options
@@ -68,11 +81,12 @@ python3 qodo_usage_metrics.py --org acme-corp --anonymize repos    # repos only
 | Flag | Description |
 |---|---|
 | `--org` | One or more GitHub org logins (required). Users are pooled across all orgs given. |
-| `--since` | Start date `YYYY-MM-DD` (inclusive). Mutually exclusive with `--days`. |
+| `--since` | Start date `YYYY-MM-DD` (inclusive), on PR **creation** date. Mutually exclusive with `--days`. |
 | `--days` | Lookback window in days (default: `90`). |
-| `--until` | End date `YYYY-MM-DD` (inclusive; defaults to today). |
+| `--until` | End date `YYYY-MM-DD` (inclusive; defaults to today), on PR **creation** date. |
 | `--repos` | Limit to specific repos — only valid with a single `--org`. |
-| `--by {month,week}` | Also emit a timeframe breakout — processed PRs and unique users per period (bucketed by merge date; weeks start Monday). |
+| `--merged-only` | Count only merged PRs. Default counts every reviewed PR regardless of state (open/merged/closed). |
+| `--by {month,week}` | Also emit a timeframe breakout — processed PRs and unique users per period (bucketed by creation date; weeks start Monday). |
 | `--chunk-days` | Date-window size per search query (default: `30`). Lower it if a run warns the 1000-result search cap was hit. |
 | `--anonymize [SCOPE]` | Replace identifying data with stable pseudonyms. `SCOPE`: `users`, `repos`, or omit for both. Anonymized repos also drop the PR URL. |
 | `--output-dir` | Directory to write CSVs into (default: `reports/`). |
@@ -86,7 +100,11 @@ plus an `_anon` suffix when anonymized).
 | File | Rows | Columns |
 |---|---|---|
 | `…_by_user.csv` | one per user | `user, processed_prs` |
-| `…_processed_prs.csv` | one per processed PR | `org, repo, pr_number, pr_url, user, created_at, merged_at` |
+| `…_processed_prs.csv` | one per processed PR | `org, repo, pr_number, pr_url, state, user, created_at, merged_at` |
+
+The `state` column (`open`/`closed`/`merged`) makes the count auditable — you can
+see at a glance how many reviewed PRs were merged versus still open. A blank
+`merged_at` means the PR was reviewed but not merged.
 
 `by_user.csv` is the headline report — processed PRs per user, sorted with the
 largest counts first; its row count is the number of **unique users** (also
@@ -95,7 +113,7 @@ kept for traceability. Every count treats a PR as a single unit, regardless of
 how many times Qodo reviewed it.
 
 With `--by month` (or `--by week`) two more files are written, giving the same
-usage/user counts over time (bucketed by merge date, ordered chronologically):
+usage/user counts over time (bucketed by creation date, ordered chronologically):
 
 | File | Rows | Columns |
 |---|---|---|
