@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Count Qodo-processed pull requests, broken down by user and by git repo / org.
+Count Qodo-processed pull requests per user.
 
 A PR is "processed" if Qodo reviewed it — i.e. it carries at least one
 "Code Review by Qodo" comment. Qodo may review a single PR more than once
@@ -8,8 +8,9 @@ A PR is "processed" if Qodo reviewed it — i.e. it carries at least one
 many Qodo reviews it received.
 
 This is the slimmed-down sibling of qodo-pr-metrics. It does NOT parse
-suggestions, implementation rates, LOC, reviewers, or timing — it answers one
-question cheaply: how many PRs did Qodo process, and whose / in which repo?
+suggestions, implementation rates, LOC, reviewers, or timing, and it does NOT
+break down by repo — it answers one question cheaply: how many PRs did Qodo
+process, per user, and how many unique users is that?
 
 It works entirely from GitHub's search index (the `"Code Review by Qodo"
 in:comments` qualifier), so it makes one date-chunked search per org and never
@@ -22,7 +23,7 @@ Usage:
   # Default 90-day lookback, one org
   python3 qodo_usage_metrics.py --org acme-corp
 
-  # Several orgs in one run (enables a meaningful by-org breakdown)
+  # Several orgs in one run (users are pooled across them)
   python3 qodo_usage_metrics.py --org acme-corp widgets-inc
 
   # Custom window
@@ -209,47 +210,19 @@ def search_processed_prs(
 # Aggregation (pure — unit-tested)
 # --------------------------------------------------------------------------- #
 
-def aggregate(rows: List[dict]) -> Dict[str, List[dict]]:
-    """Roll processed-PR rows up into the breakdown tables.
+def aggregate_by_user(rows: List[dict]) -> List[dict]:
+    """Roll processed-PR rows up into a per-user count.
 
-    Every PR row counts once. Returns a dict of table-name -> list of dict rows,
-    each list sorted with the largest counts first (ties broken alphabetically).
+    Every PR counts once (the searcher de-dupes by PR, so a PR Qodo reviewed
+    multiple times is still one row here). Sorted with the largest counts first,
+    ties broken alphabetically. The length of the returned list is the number of
+    unique users.
     """
-    by_user: Counter = Counter()
-    by_org: Counter = Counter()
-    by_repo: Counter = Counter()          # keyed by (org, repo)
-    by_user_repo: Counter = Counter()     # keyed by (user, org, repo)
-
-    for r in rows:
-        user, org, repo = r["user"], r["org"], r["repo"]
-        by_user[user] += 1
-        by_org[org] += 1
-        by_repo[(org, repo)] += 1
-        by_user_repo[(user, org, repo)] += 1
-
-    def _rank(key):
-        # Sort by descending count, then by the key for stable, readable output.
-        count, k = key
-        return (-count, k if isinstance(k, str) else tuple(k))
-
-    return {
-        "by_user": [
-            {"user": u, "processed_prs": c}
-            for u, c in sorted(by_user.items(), key=lambda kv: (-kv[1], kv[0]))
-        ],
-        "by_org": [
-            {"org": o, "processed_prs": c}
-            for o, c in sorted(by_org.items(), key=lambda kv: (-kv[1], kv[0]))
-        ],
-        "by_repo": [
-            {"org": k[0], "repo": k[1], "processed_prs": c}
-            for k, c in sorted(by_repo.items(), key=lambda kv: (-kv[1], kv[0]))
-        ],
-        "by_user_repo": [
-            {"user": k[0], "org": k[1], "repo": k[2], "processed_prs": c}
-            for k, c in sorted(by_user_repo.items(), key=lambda kv: (-kv[1], kv[0]))
-        ],
-    }
+    by_user: Counter = Counter(r["user"] for r in rows)
+    return [
+        {"user": u, "processed_prs": c}
+        for u, c in sorted(by_user.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -314,26 +287,23 @@ def _write_csv(path: Path, columns: List[str], rows: Iterable[dict]) -> None:
 
 
 def write_all(rows: List[dict], stem: str, out_dir: Path) -> List[Path]:
-    """Write the raw per-PR CSV plus the four breakdown CSVs. Returns the paths."""
+    """Write the per-user count CSV plus the raw per-PR evidence CSV.
+
+    Returns the written paths. by_user is the headline report; the raw file is
+    the underlying processed-PR list, kept for traceability.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    tables = aggregate(rows)
     written = []
+
+    by_user_path = out_dir / f"{stem}_by_user.csv"
+    _write_csv(by_user_path, ["user", "processed_prs"], aggregate_by_user(rows))
+    written.append(by_user_path)
 
     raw_path = out_dir / f"{stem}_processed_prs.csv"
     _write_csv(raw_path, RAW_COLUMNS,
                sorted(rows, key=lambda r: (r["org"], r["repo"], r["pr_number"])))
     written.append(raw_path)
 
-    table_columns = {
-        "by_user": ["user", "processed_prs"],
-        "by_org": ["org", "processed_prs"],
-        "by_repo": ["org", "repo", "processed_prs"],
-        "by_user_repo": ["user", "org", "repo", "processed_prs"],
-    }
-    for name, cols in table_columns.items():
-        path = out_dir / f"{stem}_{name}.csv"
-        _write_csv(path, cols, tables[name])
-        written.append(path)
     return written
 
 
@@ -399,13 +369,12 @@ def main():
     stem = _output_stem(orgs, since, until, args.anonymize)
     written = write_all(rows, stem, args.output_dir)
 
-    tables = aggregate(rows)
+    by_user = aggregate_by_user(rows)
     print()
     print(f"Window:            {since} → {until}")
     print(f"Orgs:              {', '.join(orgs)}")
     print(f"Processed PRs:     {len(rows)}")
-    print(f"Distinct users:    {len(tables['by_user'])}")
-    print(f"Distinct repos:    {len(tables['by_repo'])}")
+    print(f"Unique users:      {len(by_user)}")
     print("\nCSVs written:")
     for path in written:
         print(f"  {path}")

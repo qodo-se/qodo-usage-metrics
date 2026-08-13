@@ -3,12 +3,13 @@
 A slimmed-down companion to [qodo-pr-metrics](https://github.com/qodo-se/qodo-pr-metrics).
 It answers **one** question, cheaply and shareably:
 
-> How many pull requests did Qodo process, broken down by **user** and by
-> **git repo / git org**?
+> How many pull requests did Qodo process, **per user** — and how many
+> **unique users** is that?
 
 Where `qodo-pr-metrics` produces a rich impact report (suggestion volume,
 implementation rates, reviewer velocity, LOC, adoption matrices), this tool
-does none of that. It just counts **processed PRs** and writes plain CSVs.
+does none of that, and it does not break down by repo. It just counts
+**processed PRs per user** and writes plain CSVs.
 
 ## What "processed" means
 
@@ -70,7 +71,7 @@ python3 qodo_usage_metrics.py --org acme-corp --anonymize repos    # repos only
 
 | Flag | Description |
 |---|---|
-| `--org` | One or more GitHub org logins (required). Multiple orgs enable a real by-org breakdown. |
+| `--org` | One or more GitHub org logins (required). Users are pooled across all orgs given. |
 | `--since` | Start date `YYYY-MM-DD` (inclusive). Mutually exclusive with `--days`. |
 | `--days` | Lookback window in days (default: `90`). |
 | `--until` | End date `YYYY-MM-DD` (inclusive; defaults to today). |
@@ -87,15 +88,14 @@ plus an `_anon` suffix when anonymized).
 
 | File | Rows | Columns |
 |---|---|---|
-| `…_processed_prs.csv` | one per processed PR | `org, repo, pr_number, pr_url, user, created_at, merged_at` |
 | `…_by_user.csv` | one per user | `user, processed_prs` |
-| `…_by_org.csv` | one per org | `org, processed_prs` |
-| `…_by_repo.csv` | one per repo | `org, repo, processed_prs` |
-| `…_by_user_repo.csv` | one per user×repo | `user, org, repo, processed_prs` |
+| `…_processed_prs.csv` | one per processed PR | `org, repo, pr_number, pr_url, user, created_at, merged_at` |
 
-The four breakdown files are simple rollups of the raw file, sorted with the
-largest counts first — provided so you don't have to pivot the raw CSV
-yourself. Every count treats a PR as a single unit.
+`by_user.csv` is the headline report — processed PRs per user, sorted with the
+largest counts first; its row count is the number of **unique users** (also
+printed in the run summary). `processed_prs.csv` is the underlying per-PR list,
+kept for traceability. Every count treats a PR as a single unit, regardless of
+how many times Qodo reviewed it.
 
 ## Tests
 
