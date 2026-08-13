@@ -1,4 +1,4 @@
-# qodo-pr-counts
+# qodo-usage-metrics
 
 A slimmed-down companion to [qodo-pr-metrics](https://github.com/qodo-se/qodo-pr-metrics).
 It answers **one** question, cheaply and shareably:
@@ -47,23 +47,23 @@ gh auth refresh -s repo
 
 ```bash
 # Default 90-day lookback, one org
-python3 qodo_pr_counts.py --org acme-corp
+python3 qodo_usage_metrics.py --org acme-corp
 
 # Several orgs in one run (makes the by-org breakdown meaningful)
-python3 qodo_pr_counts.py --org acme-corp widgets-inc
+python3 qodo_usage_metrics.py --org acme-corp widgets-inc
 
 # Custom window
-python3 qodo_pr_counts.py --org acme-corp --since 2025-05-12
-python3 qodo_pr_counts.py --org acme-corp --days 30
-python3 qodo_pr_counts.py --org acme-corp --since 2025-05-12 --until 2025-08-12
+python3 qodo_usage_metrics.py --org acme-corp --since 2025-05-12
+python3 qodo_usage_metrics.py --org acme-corp --days 30
+python3 qodo_usage_metrics.py --org acme-corp --since 2025-05-12 --until 2025-08-12
 
 # Scope to specific repos within a single org
-python3 qodo_pr_counts.py --org acme-corp --repos frontend-app backend-api
+python3 qodo_usage_metrics.py --org acme-corp --repos frontend-app backend-api
 
 # Anonymize for external sharing (stable pseudonyms; _anon filename suffix)
-python3 qodo_pr_counts.py --org acme-corp --anonymize          # users + repos
-python3 qodo_pr_counts.py --org acme-corp --anonymize users    # users only
-python3 qodo_pr_counts.py --org acme-corp --anonymize repos    # repos only
+python3 qodo_usage_metrics.py --org acme-corp --anonymize          # users + repos
+python3 qodo_usage_metrics.py --org acme-corp --anonymize users    # users only
+python3 qodo_usage_metrics.py --org acme-corp --anonymize repos    # repos only
 ```
 
 ### Options

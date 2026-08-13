@@ -20,20 +20,20 @@ Output: CSV files only, written into ./reports/ (created automatically).
 
 Usage:
   # Default 90-day lookback, one org
-  python3 qodo_pr_counts.py --org acme-corp
+  python3 qodo_usage_metrics.py --org acme-corp
 
   # Several orgs in one run (enables a meaningful by-org breakdown)
-  python3 qodo_pr_counts.py --org acme-corp widgets-inc
+  python3 qodo_usage_metrics.py --org acme-corp widgets-inc
 
   # Custom window
-  python3 qodo_pr_counts.py --org acme-corp --since 2025-05-12
-  python3 qodo_pr_counts.py --org acme-corp --days 30
+  python3 qodo_usage_metrics.py --org acme-corp --since 2025-05-12
+  python3 qodo_usage_metrics.py --org acme-corp --days 30
 
   # Scope to specific repos within a single org
-  python3 qodo_pr_counts.py --org acme-corp --repos frontend-app backend-api
+  python3 qodo_usage_metrics.py --org acme-corp --repos frontend-app backend-api
 
   # Anonymize users and/or repos for external sharing
-  python3 qodo_pr_counts.py --org acme-corp --anonymize
+  python3 qodo_usage_metrics.py --org acme-corp --anonymize
 """
 
 import argparse

@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qodo_pr_counts import aggregate, build_anon_maps, apply_anonymization  # noqa: E402
+from qodo_usage_metrics import aggregate, build_anon_maps, apply_anonymization  # noqa: E402
 
 
 def _row(user, org, repo, number):
