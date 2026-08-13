@@ -103,6 +103,9 @@ def run_gh(args: List[str]) -> str:
     """
     cmd = ["gh"] + args
     rate_retried = False
+    # One retry budget shared by timeouts and transient HTTP failures — by
+    # design: it caps total backoff (~5s+15s+45s) so a flaky link fails loudly
+    # rather than blocking indefinitely, per this function's contract.
     http_retries = 0
     max_http_retries = 3
     while True:
@@ -422,9 +425,8 @@ def check_token_scope() -> None:
         out = subprocess.run(["gh", "api", "-i", "user"],
                              capture_output=True, text=True, timeout=15)
     except Exception:
-        # Best-effort advisory only: validate_orgs() above already proved gh
-        # works and exits loudly otherwise, so this realistically only catches
-        # the 15s timeout. Degrade silently — a scope hint must never crash the
+        # Best-effort advisory only: degrade silently on any failure (timeout,
+        # network blip, unexpected output). A scope hint must never crash the
         # run, and the zero-result warning already names token scope as a cause.
         return
     for line in out.stdout.splitlines():
@@ -460,10 +462,22 @@ def validate_orgs(orgs: List[str], repos: Optional[List[str]] = None) -> None:
                   f"pre-flight existence check for it.", file=sys.stderr)
             continue
         if out.returncode != 0:
-            sys.exit(
-                f"Org '{org}' could not be resolved with your gh auth "
-                f"(typo, or no access). Check the name and `gh auth status`.\n"
-                f"{out.stderr.strip()}")
+            stderr = out.stderr.strip()
+            # A 404 is the definitive "this org login doesn't resolve for your
+            # auth" signal — the typo/no-access case this pre-flight exists to
+            # catch — so fail loudly. Any other non-zero (HTTP 5xx, rate limit,
+            # network/stream error) is transient or ambiguous: don't turn it
+            # into a fatal, misleading "typo" error before the run even starts.
+            # Warn and let run_gh() surface it, with retries, once search begins.
+            if re.search(r"HTTP 404|Not Found", stderr):
+                sys.exit(
+                    f"Org '{org}' could not be resolved with your gh auth "
+                    f"(typo, or no access). Check the name and `gh auth status`.\n"
+                    f"{stderr}")
+            print(f"  Warning: couldn't complete the pre-flight check for org "
+                  f"'{org}' (likely transient); continuing. If the run finds no "
+                  f"PRs, re-verify the org name.\n    {stderr}", file=sys.stderr)
+            continue
         kind = out.stdout.strip()
         if kind != "Organization" and not repos:
             print(f"  Warning: '{org}' is a {kind}, not an Organization. The "
