@@ -72,6 +72,7 @@ python3 qodo_usage_metrics.py --org acme-corp --anonymize repos    # repos only
 | `--days` | Lookback window in days (default: `90`). |
 | `--until` | End date `YYYY-MM-DD` (inclusive; defaults to today). |
 | `--repos` | Limit to specific repos — only valid with a single `--org`. |
+| `--by {month,week}` | Also emit a timeframe breakout — processed PRs and unique users per period (bucketed by merge date; weeks start Monday). |
 | `--chunk-days` | Date-window size per search query (default: `30`). Lower it if a run warns the 1000-result search cap was hit. |
 | `--anonymize [SCOPE]` | Replace identifying data with stable pseudonyms. `SCOPE`: `users`, `repos`, or omit for both. Anonymized repos also drop the PR URL. |
 | `--output-dir` | Directory to write CSVs into (default: `reports/`). |
@@ -92,6 +93,18 @@ largest counts first; its row count is the number of **unique users** (also
 printed in the run summary). `processed_prs.csv` is the underlying per-PR list,
 kept for traceability. Every count treats a PR as a single unit, regardless of
 how many times Qodo reviewed it.
+
+With `--by month` (or `--by week`) two more files are written, giving the same
+usage/user counts over time (bucketed by merge date, ordered chronologically):
+
+| File | Rows | Columns |
+|---|---|---|
+| `…_by_{month,week}.csv` | one per period | `period, processed_prs, unique_users` |
+| `…_by_user_{month,week}.csv` | one per user × period | `period, user, processed_prs` |
+
+The `period` is `YYYY-MM` for months, or the Monday of the ISO week (`YYYY-MM-DD`)
+for weeks. Unique-user counts are per period, so they do not sum to the overall
+unique-user total (a user active in two months counts in both).
 
 ## Tests
 

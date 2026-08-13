@@ -31,6 +31,9 @@ Usage:
   # Scope to specific repos within a single org
   python3 qodo_usage_metrics.py --org acme-corp --repos frontend-app backend-api
 
+  # Timeframe breakout: usage and unique users per month (or per week)
+  python3 qodo_usage_metrics.py --org acme-corp --by month
+
   # Anonymize users and/or repos for external sharing
   python3 qodo_usage_metrics.py --org acme-corp --anonymize
 """
@@ -223,6 +226,64 @@ def aggregate_by_user(rows: List[dict]) -> List[dict]:
     ]
 
 
+UNKNOWN_PERIOD = "unknown"
+
+
+def period_key(iso_ts: str, by: str) -> str:
+    """Bucket an ISO-8601 timestamp into a period label.
+
+    `by` is 'month' -> 'YYYY-MM', or 'week' -> the Monday of that ISO week as
+    'YYYY-MM-DD'. Blank/unparseable timestamps bucket to 'unknown'.
+    """
+    if not iso_ts:
+        return UNKNOWN_PERIOD
+    try:
+        d = date.fromisoformat(iso_ts[:10])
+    except ValueError:
+        return UNKNOWN_PERIOD
+    if by == "month":
+        return f"{d.year:04d}-{d.month:02d}"
+    if by == "week":
+        monday = d - timedelta(days=d.weekday())
+        return monday.isoformat()
+    raise ValueError(f"unknown period: {by!r}")
+
+
+def aggregate_by_period(rows: List[dict], by: str) -> List[dict]:
+    """Per-period processed-PR and unique-user counts, ordered chronologically.
+
+    PRs are bucketed by merge date. 'unknown' (if any) sorts last.
+    """
+    prs: Counter = Counter()
+    users: Dict[str, set] = {}
+    for r in rows:
+        p = period_key(r.get("merged_at", ""), by)
+        prs[p] += 1
+        users.setdefault(p, set()).add(r["user"])
+    return [
+        {"period": p, "processed_prs": prs[p], "unique_users": len(users[p])}
+        for p in sorted(prs, key=lambda p: (p == UNKNOWN_PERIOD, p))
+    ]
+
+
+def aggregate_by_user_period(rows: List[dict], by: str) -> List[dict]:
+    """Per-user, per-period processed-PR counts.
+
+    Ordered by period (chronological, 'unknown' last), then by count descending,
+    then user alphabetically.
+    """
+    counts: Counter = Counter()
+    for r in rows:
+        counts[(period_key(r.get("merged_at", ""), by), r["user"])] += 1
+    return [
+        {"period": p, "user": u, "processed_prs": c}
+        for (p, u), c in sorted(
+            counts.items(),
+            key=lambda kv: (kv[0][0] == UNKNOWN_PERIOD, kv[0][0], -kv[1], kv[0][1]),
+        )
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Anonymization (pure — unit-tested)
 # --------------------------------------------------------------------------- #
@@ -284,8 +345,13 @@ def _write_csv(path: Path, columns: List[str], rows: Iterable[dict]) -> None:
         writer.writerows(rows)
 
 
-def write_all(rows: List[dict], stem: str, out_dir: Path) -> List[Path]:
+def write_all(rows: List[dict], stem: str, out_dir: Path,
+              by: Optional[str] = None) -> List[Path]:
     """Write the per-user count CSV plus the raw per-PR evidence CSV.
+
+    When `by` is 'month' or 'week', also writes per-period breakouts:
+    `_by_{by}.csv` (period totals + unique users) and `_by_user_{by}.csv`
+    (per-user counts per period).
 
     Returns the written paths. by_user is the headline report; the raw file is
     the underlying processed-PR list, kept for traceability.
@@ -296,6 +362,17 @@ def write_all(rows: List[dict], stem: str, out_dir: Path) -> List[Path]:
     by_user_path = out_dir / f"{stem}_by_user.csv"
     _write_csv(by_user_path, ["user", "processed_prs"], aggregate_by_user(rows))
     written.append(by_user_path)
+
+    if by:
+        period_path = out_dir / f"{stem}_by_{by}.csv"
+        _write_csv(period_path, ["period", "processed_prs", "unique_users"],
+                   aggregate_by_period(rows, by))
+        written.append(period_path)
+
+        user_period_path = out_dir / f"{stem}_by_user_{by}.csv"
+        _write_csv(user_period_path, ["period", "user", "processed_prs"],
+                   aggregate_by_user_period(rows, by))
+        written.append(user_period_path)
 
     raw_path = out_dir / f"{stem}_processed_prs.csv"
     _write_csv(raw_path, RAW_COLUMNS,
@@ -339,6 +416,9 @@ def main():
                    help="Replace identifying data with stable pseudonyms. "
                         "SCOPE: 'users', 'repos', or omit to anonymize both. "
                         "Output filenames get an _anon suffix.")
+    p.add_argument("--by", choices=["month", "week"], default=None, metavar="PERIOD",
+                   help="Also emit a timeframe breakout of processed PRs and unique "
+                        "users per PERIOD ('month' or 'week', bucketed by merge date).")
     p.add_argument("--output-dir", type=Path, default=REPORTS_DIR, metavar="DIR",
                    help="Directory to write CSVs into (default: reports/)")
     args = p.parse_args()
@@ -365,7 +445,7 @@ def main():
         rows = apply_anonymization(rows, user_map, org_map, repo_map)
 
     stem = _output_stem(orgs, since, until, args.anonymize)
-    written = write_all(rows, stem, args.output_dir)
+    written = write_all(rows, stem, args.output_dir, by=args.by)
 
     by_user = aggregate_by_user(rows)
     print()
@@ -373,6 +453,11 @@ def main():
     print(f"Orgs:              {', '.join(orgs)}")
     print(f"Processed PRs:     {len(rows)}")
     print(f"Unique users:      {len(by_user)}")
+    if args.by:
+        print(f"\nBy {args.by} (bucketed by merge date):")
+        for row in aggregate_by_period(rows, args.by):
+            print(f"  {row['period']:<10} {row['processed_prs']:>4} PRs   "
+                  f"{row['unique_users']:>3} users")
     print("\nCSVs written:")
     for path in written:
         print(f"  {path}")

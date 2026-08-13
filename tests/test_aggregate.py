@@ -6,14 +6,15 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qodo_usage_metrics import (  # noqa: E402
-    aggregate_by_user, build_anon_maps, apply_anonymization,
+    aggregate_by_user, aggregate_by_period, aggregate_by_user_period,
+    period_key, build_anon_maps, apply_anonymization,
 )
 
 
-def _row(user, org, repo, number):
+def _row(user, org, repo, number, merged_at=""):
     return {
         "org": org, "repo": repo, "pr_number": number, "pr_url": "",
-        "user": user, "created_at": "", "merged_at": "",
+        "user": user, "created_at": "", "merged_at": merged_at,
     }
 
 
@@ -68,3 +69,49 @@ def test_anonymize_users_only_keeps_repos_visible():
     assert anon[0]["user"].startswith("user-")
     assert anon[0]["org"] == "acme"
     assert anon[0]["repo"] == "frontend"
+
+
+# --- timeframe breakout ---------------------------------------------------- #
+
+DATED = [
+    _row("alice", "acme", "frontend", 1, "2026-05-04T10:00:00Z"),  # Mon 2026-05-04
+    _row("bob", "acme", "frontend", 2, "2026-05-06T10:00:00Z"),    # Wed, same week
+    _row("alice", "acme", "backend", 3, "2026-06-30T23:59:59Z"),   # June
+    _row("carol", "widgets", "api", 4, ""),                        # unknown period
+]
+
+
+def test_period_key_month_and_week():
+    assert period_key("2026-05-06T10:00:00Z", "month") == "2026-05"
+    # Wednesday 2026-05-06 -> Monday of its ISO week is 2026-05-04
+    assert period_key("2026-05-06T10:00:00Z", "week") == "2026-05-04"
+    assert period_key("", "month") == "unknown"
+    assert period_key("not-a-date", "week") == "unknown"
+
+
+def test_aggregate_by_period_month_counts_and_unique_users():
+    out = aggregate_by_period(DATED, "month")
+    by_period = {r["period"]: r for r in out}
+    assert by_period["2026-05"]["processed_prs"] == 2
+    assert by_period["2026-05"]["unique_users"] == 2   # alice + bob
+    assert by_period["2026-06"]["processed_prs"] == 1
+    assert by_period["2026-06"]["unique_users"] == 1
+    # chronological order, 'unknown' sorts last
+    assert [r["period"] for r in out] == ["2026-05", "2026-06", "unknown"]
+
+
+def test_aggregate_by_period_week_groups_same_week():
+    out = aggregate_by_period(DATED, "week")
+    by_period = {r["period"]: r for r in out}
+    # alice(Mon) + bob(Wed) fall in the same ISO week -> one bucket of 2
+    assert by_period["2026-05-04"]["processed_prs"] == 2
+    assert by_period["2026-05-04"]["unique_users"] == 2
+
+
+def test_aggregate_by_user_period():
+    out = aggregate_by_user_period(DATED, "month")
+    triples = {(r["period"], r["user"]): r["processed_prs"] for r in out}
+    assert triples[("2026-05", "alice")] == 1
+    assert triples[("2026-05", "bob")] == 1
+    assert triples[("2026-06", "alice")] == 1
+    assert triples[("unknown", "carol")] == 1
