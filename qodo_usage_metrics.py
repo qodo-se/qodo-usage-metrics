@@ -106,7 +106,21 @@ def run_gh(args: List[str]) -> str:
     http_retries = 0
     max_http_retries = 3
     while True:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding="utf-8", timeout=120)
+        except subprocess.TimeoutExpired:
+            # A hung request is a transient failure like a 5xx — retry on the
+            # same backoff, then give up loudly rather than blocking forever.
+            if http_retries < max_http_retries:
+                http_retries += 1
+                wait = 5 * (3 ** (http_retries - 1))  # 5s, 15s, 45s
+                print(f"\n  request timed out — retrying in {wait}s "
+                      f"({http_retries}/{max_http_retries})...",
+                      file=sys.stderr, flush=True)
+                time.sleep(wait)
+                continue
+            sys.exit(f"`{' '.join(cmd)}` timed out after {max_http_retries} retries")
         if result.returncode == 0:
             return result.stdout
         stderr = result.stderr
@@ -408,6 +422,10 @@ def check_token_scope() -> None:
         out = subprocess.run(["gh", "api", "-i", "user"],
                              capture_output=True, text=True, timeout=15)
     except Exception:
+        # Best-effort advisory only: validate_orgs() above already proved gh
+        # works and exits loudly otherwise, so this realistically only catches
+        # the 15s timeout. Degrade silently — a scope hint must never crash the
+        # run, and the zero-result warning already names token scope as a cause.
         return
     for line in out.stdout.splitlines():
         if line.lower().startswith("x-oauth-scopes:"):
@@ -420,25 +438,38 @@ def check_token_scope() -> None:
             return
 
 
-def validate_orgs(orgs: List[str]) -> None:
+def validate_orgs(orgs: List[str], repos: Optional[List[str]] = None) -> None:
     """Fail loudly on an org login that can't be resolved, warn on non-orgs.
 
     A typo'd or inaccessible org otherwise yields a clean-looking "0 processed
     PRs" report with exit 0 — the worst failure mode for a shared tool.
+
+    The non-Organization warning is suppressed when `repos` is given: a
+    `--repos` run searches with `repo:owner/name` qualifiers, which resolve for
+    user-owned repos too, so results are not necessarily empty in that case.
     """
     for org in orgs:
-        out = subprocess.run(["gh", "api", f"users/{org}", "-q", ".type"],
-                             capture_output=True, text=True)
+        try:
+            out = subprocess.run(["gh", "api", f"users/{org}", "-q", ".type"],
+                                 capture_output=True, text=True, timeout=15)
+        except subprocess.TimeoutExpired:
+            # Pre-flight probe only: don't block an otherwise-legitimate run on a
+            # flaky network here. A real connectivity problem resurfaces loudly
+            # in run_gh() once searching starts.
+            print(f"  Warning: validating org '{org}' timed out; skipping the "
+                  f"pre-flight existence check for it.", file=sys.stderr)
+            continue
         if out.returncode != 0:
             sys.exit(
                 f"Org '{org}' could not be resolved with your gh auth "
                 f"(typo, or no access). Check the name and `gh auth status`.\n"
                 f"{out.stderr.strip()}")
         kind = out.stdout.strip()
-        if kind != "Organization":
+        if kind != "Organization" and not repos:
             print(f"  Warning: '{org}' is a {kind}, not an Organization. The "
                   f"`org:` search qualifier only matches organizations, so "
-                  f"results for it will be empty.", file=sys.stderr)
+                  f"results for it will be empty. Scope to repos with --repos.",
+                  file=sys.stderr)
 
 
 def _output_stem(orgs: List[str], since: date, until: date, anonymize: Optional[str]) -> str:
@@ -495,7 +526,7 @@ def main():
     if since > until:
         p.error(f"--since ({since}) is after --until ({until})")
 
-    validate_orgs(orgs)
+    validate_orgs(orgs, args.repos)
     check_token_scope()
 
     rows: List[dict] = []
