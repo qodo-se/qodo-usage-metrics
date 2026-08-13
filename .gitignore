@@ -1,0 +1,9 @@
+# Generated CSVs — contain real org PR data, never commit
+reports/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
