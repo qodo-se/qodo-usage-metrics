@@ -11,10 +11,10 @@ from qodo_usage_metrics import (  # noqa: E402
 )
 
 
-def _row(user, org, repo, number, merged_at=""):
+def _row(user, org, repo, number, created_at="", merged_at=""):
     return {
-        "org": org, "repo": repo, "pr_number": number, "pr_url": "",
-        "user": user, "created_at": "", "merged_at": merged_at,
+        "org": org, "repo": repo, "pr_number": number, "pr_url": "", "state": "open",
+        "user": user, "created_at": created_at, "merged_at": merged_at,
     }
 
 
@@ -74,10 +74,10 @@ def test_anonymize_users_only_keeps_repos_visible():
 # --- timeframe breakout ---------------------------------------------------- #
 
 DATED = [
-    _row("alice", "acme", "frontend", 1, "2026-05-04T10:00:00Z"),  # Mon 2026-05-04
-    _row("bob", "acme", "frontend", 2, "2026-05-06T10:00:00Z"),    # Wed, same week
-    _row("alice", "acme", "backend", 3, "2026-06-30T23:59:59Z"),   # June
-    _row("carol", "widgets", "api", 4, ""),                        # unknown period
+    _row("alice", "acme", "frontend", 1, created_at="2026-05-04T10:00:00Z"),  # Mon 2026-05-04
+    _row("bob", "acme", "frontend", 2, created_at="2026-05-06T10:00:00Z"),    # Wed, same week
+    _row("alice", "acme", "backend", 3, created_at="2026-06-30T23:59:59Z"),   # June
+    _row("carol", "widgets", "api", 4, created_at=""),                        # unknown period
 ]
 
 
@@ -115,3 +115,14 @@ def test_aggregate_by_user_period():
     assert triples[("2026-05", "bob")] == 1
     assert triples[("2026-06", "alice")] == 1
     assert triples[("unknown", "carol")] == 1
+
+
+def test_unmerged_pr_counts_and_buckets_by_creation_date():
+    # The whole point of the default mode: a PR Qodo reviewed but never merged
+    # (no merge date) must still be counted, and bucketed by when it was opened
+    # — not dropped, and not dumped into 'unknown'.
+    rows = [_row("dave", "acme", "x", 9, created_at="2026-07-15T00:00:00Z", merged_at="")]
+    assert aggregate_by_user(rows) == [{"user": "dave", "processed_prs": 1}]
+    assert aggregate_by_period(rows, "month") == [
+        {"period": "2026-07", "processed_prs": 1, "unique_users": 1}
+    ]

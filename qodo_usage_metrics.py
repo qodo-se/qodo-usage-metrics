@@ -66,6 +66,7 @@ _GQL_SEARCH_QUERY = (
     "number "
     "repository{nameWithOwner} "
     "url "
+    "state "
     "author{login} "
     "createdAt mergedAt"
     "}}}}"
@@ -139,12 +140,19 @@ def search_processed_prs(
     until: Optional[date] = None,
     repos: Optional[List[str]] = None,
     chunk_days: int = 30,
+    merged_only: bool = False,
 ) -> Iterator[dict]:
-    """Yield one dict per Qodo-processed merged PR in [since, until] for `org`.
+    """Yield one dict per Qodo-processed PR created in [since, until] for `org`.
 
-    Each PR is yielded at most once even if it matches multiple search chunks.
-    Uses the `"Code Review by Qodo" in:comments` qualifier so only PRs Qodo
-    actually reviewed come back — no per-PR fetch required.
+    A PR is "processed" if Qodo reviewed it — the `"Code Review by Qodo"
+    in:comments` qualifier returns exactly those, no per-PR fetch required. By
+    default every reviewed PR is yielded regardless of state (open, merged, or
+    closed-unmerged) so the unique-user count reflects everyone Qodo reviewed;
+    pass `merged_only=True` to restrict to merged PRs.
+
+    The window filters on PR *creation* date (`created:`), which every PR has —
+    unlike merge date, which unmerged PRs lack. Each PR is yielded at most once
+    even if it matches multiple search chunks.
 
     GitHub's Search API caps any single query at 1000 results; the run is
     date-chunked to stay under that, and a warning is printed if a chunk still
@@ -152,6 +160,7 @@ def search_processed_prs(
     """
     qualifiers = [f"repo:{org}/{r}" for r in repos] if repos else [f"org:{org}"]
     end = until if until is not None else date.today()
+    merged_qual = "is:merged " if merged_only else ""
     seen = set()
     cursor = since
     while cursor <= end:
@@ -161,8 +170,8 @@ def search_processed_prs(
             print(f"  Searching {qual_label}  {cursor} .. {chunk_end} ...",
                   end="", file=sys.stderr, flush=True)
             q = (
-                f'{qual} is:pr is:merged "{QODO_MARKER}" in:comments '
-                f"merged:{cursor.isoformat()}..{chunk_end.isoformat()}"
+                f'{qual} is:pr {merged_qual}"{QODO_MARKER}" in:comments '
+                f"created:{cursor.isoformat()}..{chunk_end.isoformat()}"
             )
             end_cursor = None
             chunk_count = 0
@@ -191,6 +200,7 @@ def search_processed_prs(
                         "repo": repo,
                         "pr_number": node["number"],
                         "pr_url": node.get("url", ""),
+                        "state": (node.get("state") or "").lower(),
                         "user": (node.get("author") or {}).get("login") or UNKNOWN_USER,
                         "created_at": node.get("createdAt", ""),
                         "merged_at": node.get("mergedAt", ""),
@@ -252,12 +262,13 @@ def period_key(iso_ts: str, by: str) -> str:
 def aggregate_by_period(rows: List[dict], by: str) -> List[dict]:
     """Per-period processed-PR and unique-user counts, ordered chronologically.
 
-    PRs are bucketed by merge date. 'unknown' (if any) sorts last.
+    PRs are bucketed by creation date (every PR has one; unmerged PRs have no
+    merge date). 'unknown' (if any) sorts last.
     """
     prs: Counter = Counter()
     users: Dict[str, set] = {}
     for r in rows:
-        p = period_key(r.get("merged_at", ""), by)
+        p = period_key(r.get("created_at", ""), by)
         prs[p] += 1
         users.setdefault(p, set()).add(r["user"])
     return [
@@ -270,11 +281,11 @@ def aggregate_by_user_period(rows: List[dict], by: str) -> List[dict]:
     """Per-user, per-period processed-PR counts.
 
     Ordered by period (chronological, 'unknown' last), then by count descending,
-    then user alphabetically.
+    then user alphabetically. PRs are bucketed by creation date.
     """
     counts: Counter = Counter()
     for r in rows:
-        counts[(period_key(r.get("merged_at", ""), by), r["user"])] += 1
+        counts[(period_key(r.get("created_at", ""), by), r["user"])] += 1
     return [
         {"period": p, "user": u, "processed_prs": c}
         for (p, u), c in sorted(
@@ -335,7 +346,7 @@ def apply_anonymization(rows: List[dict], user_map, org_map, repo_map) -> List[d
 # Output
 # --------------------------------------------------------------------------- #
 
-RAW_COLUMNS = ["org", "repo", "pr_number", "pr_url", "user", "created_at", "merged_at"]
+RAW_COLUMNS = ["org", "repo", "pr_number", "pr_url", "state", "user", "created_at", "merged_at"]
 
 
 def _write_csv(path: Path, columns: List[str], rows: Iterable[dict]) -> None:
@@ -386,6 +397,50 @@ def write_all(rows: List[dict], stem: str, out_dir: Path,
 # CLI
 # --------------------------------------------------------------------------- #
 
+def check_token_scope() -> None:
+    """Warn (best-effort) if the gh token can't read private repos.
+
+    A classic token without the `repo` scope silently omits private repos from
+    search results — an undercount with no error. Fine-grained tokens don't
+    expose an X-OAuth-Scopes header, so we can only warn when we can see it.
+    """
+    try:
+        out = subprocess.run(["gh", "api", "-i", "user"],
+                             capture_output=True, text=True, timeout=15)
+    except Exception:
+        return
+    for line in out.stdout.splitlines():
+        if line.lower().startswith("x-oauth-scopes:"):
+            scopes = [s.strip() for s in line.split(":", 1)[1].split(",")]
+            if "repo" not in scopes:
+                print("  Warning: your gh token lacks the 'repo' scope; private "
+                      "repos are silently omitted from search results (undercount). "
+                      "Add it with: gh auth refresh -s repo",
+                      file=sys.stderr)
+            return
+
+
+def validate_orgs(orgs: List[str]) -> None:
+    """Fail loudly on an org login that can't be resolved, warn on non-orgs.
+
+    A typo'd or inaccessible org otherwise yields a clean-looking "0 processed
+    PRs" report with exit 0 — the worst failure mode for a shared tool.
+    """
+    for org in orgs:
+        out = subprocess.run(["gh", "api", f"users/{org}", "-q", ".type"],
+                             capture_output=True, text=True)
+        if out.returncode != 0:
+            sys.exit(
+                f"Org '{org}' could not be resolved with your gh auth "
+                f"(typo, or no access). Check the name and `gh auth status`.\n"
+                f"{out.stderr.strip()}")
+        kind = out.stdout.strip()
+        if kind != "Organization":
+            print(f"  Warning: '{org}' is a {kind}, not an Organization. The "
+                  f"`org:` search qualifier only matches organizations, so "
+                  f"results for it will be empty.", file=sys.stderr)
+
+
 def _output_stem(orgs: List[str], since: date, until: date, anonymize: Optional[str]) -> str:
     org_part = orgs[0] if len(orgs) == 1 else f"{len(orgs)}orgs"
     suffix = "_anon" if anonymize else ""
@@ -411,6 +466,9 @@ def main():
     p.add_argument("--chunk-days", type=int, default=30, metavar="N",
                    help="Date-window size per search query (default: 30). "
                         "Lower it if a run warns the 1000-result search cap was hit.")
+    p.add_argument("--merged-only", action="store_true",
+                   help="Count only merged PRs. Default counts every PR Qodo "
+                        "reviewed regardless of state (open/merged/closed).")
     p.add_argument("--anonymize", nargs="?", const="all", default=None,
                    choices=["all", "users", "repos"], metavar="SCOPE",
                    help="Replace identifying data with stable pseudonyms. "
@@ -429,16 +487,23 @@ def main():
     if args.repos:
         args.repos = list(dict.fromkeys(args.repos))
 
+    if args.chunk_days < 1:
+        p.error(f"--chunk-days must be >= 1 (got {args.chunk_days})")
+
     until = args.until or date.today()
     since = args.since or (until - timedelta(days=args.days))
     if since > until:
         p.error(f"--since ({since}) is after --until ({until})")
 
+    validate_orgs(orgs)
+    check_token_scope()
+
     rows: List[dict] = []
     for org in orgs:
         print(f"\nOrg: {org}", file=sys.stderr)
         rows.extend(search_processed_prs(
-            org, since, until, repos=args.repos, chunk_days=args.chunk_days))
+            org, since, until, repos=args.repos, chunk_days=args.chunk_days,
+            merged_only=args.merged_only))
 
     if args.anonymize:
         user_map, org_map, repo_map = build_anon_maps(rows, args.anonymize)
@@ -449,18 +514,28 @@ def main():
 
     by_user = aggregate_by_user(rows)
     print()
-    print(f"Window:            {since} → {until}")
+    print(f"Window (by PR creation date): {since} → {until}")
     print(f"Orgs:              {', '.join(orgs)}")
+    print(f"Scope:             {'merged PRs only' if args.merged_only else 'all reviewed PRs (any state)'}")
     print(f"Processed PRs:     {len(rows)}")
     print(f"Unique users:      {len(by_user)}")
     if args.by:
-        print(f"\nBy {args.by} (bucketed by merge date):")
+        print(f"\nBy {args.by} (bucketed by creation date):")
         for row in aggregate_by_period(rows, args.by):
             print(f"  {row['period']:<10} {row['processed_prs']:>4} PRs   "
                   f"{row['unique_users']:>3} users")
     print("\nCSVs written:")
     for path in written:
         print(f"  {path}")
+
+    if not rows:
+        print("\n  WARNING: 0 matching PRs found — this is probably not what you "
+              "want. Likely causes:\n"
+              "    - wrong --org (typo) or no access to its private repos\n"
+              "    - gh token missing the 'repo' scope (see any warning above)\n"
+              "    - the window (--since / --until / --days) has no reviewed PRs\n"
+              f"    - this Qodo deployment's review header differs from "
+              f"'{QODO_MARKER}'", file=sys.stderr)
 
 
 if __name__ == "__main__":
