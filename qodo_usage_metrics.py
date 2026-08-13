@@ -407,7 +407,8 @@ def check_token_scope() -> None:
     try:
         out = subprocess.run(["gh", "api", "-i", "user"],
                              capture_output=True, text=True, timeout=15)
-    except Exception:
+    except Exception as exc:
+        print(f"  Warning: could not check gh token scope: {exc}", file=sys.stderr)
         return
     for line in out.stdout.splitlines():
         if line.lower().startswith("x-oauth-scopes:"):
@@ -428,7 +429,7 @@ def validate_orgs(orgs: List[str]) -> None:
     """
     for org in orgs:
         out = subprocess.run(["gh", "api", f"users/{org}", "-q", ".type"],
-                             capture_output=True, text=True)
+                             capture_output=True, text=True, timeout=15)
         if out.returncode != 0:
             sys.exit(
                 f"Org '{org}' could not be resolved with your gh auth "
