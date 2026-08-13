@@ -1,15 +1,12 @@
 # qodo-usage-metrics
 
-A slimmed-down companion to [qodo-pr-metrics](https://github.com/qodo-se/qodo-pr-metrics).
-It answers **one** question, cheaply and shareably:
+Counts Qodo usage as processed pull requests, per user. It answers **one**
+question, cheaply and shareably:
 
 > How many pull requests did Qodo process, **per user** — and how many
 > **unique users** is that?
 
-Where `qodo-pr-metrics` produces a rich impact report (suggestion volume,
-implementation rates, reviewer velocity, LOC, adoption matrices), this tool
-does none of that, and it does not break down by repo. It just counts
-**processed PRs per user** and writes plain CSVs.
+It just counts **processed PRs per user** and writes plain CSVs.
 
 ## What "processed" means
 
@@ -22,10 +19,9 @@ of how many Qodo reviews it received.
 
 It relies entirely on GitHub's search index — the `"Code Review by Qodo"
 in:comments` search qualifier returns exactly the processed PRs, with the
-author and repository attached. So the tool makes one date-chunked search per
-org and **never fetches individual PR bodies, comments, diffs, or LOC.** A run
-over a large org is typically seconds-to-minutes, not the full walk the parent
-tool performs.
+author attached. So the tool makes one date-chunked search per org and
+**never fetches individual PR bodies, comments, or diffs.** A run over a large
+org is typically seconds-to-minutes.
 
 ## Prerequisites
 
@@ -104,11 +100,3 @@ Pure aggregation and anonymization logic is unit-tested without any network:
 ```bash
 python3 -m pytest tests/ -q
 ```
-
-## Relationship to qodo-pr-metrics
-
-This repo intentionally shares the parent's Qodo-comment detection approach
-(the stable `Code Review by Qodo` marker) and its `gh`-CLI transport, but keeps
-only the search step. If you need suggestion counts, implementation rates,
-timing, LOC, or the HTML reports, use
-[qodo-pr-metrics](https://github.com/qodo-se/qodo-pr-metrics) instead.

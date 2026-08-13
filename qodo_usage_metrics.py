@@ -7,10 +7,8 @@ A PR is "processed" if Qodo reviewed it — i.e. it carries at least one
 (e.g. on each push); this tool counts each PR exactly once regardless of how
 many Qodo reviews it received.
 
-This is the slimmed-down sibling of qodo-pr-metrics. It does NOT parse
-suggestions, implementation rates, LOC, reviewers, or timing, and it does NOT
-break down by repo — it answers one question cheaply: how many PRs did Qodo
-process, per user, and how many unique users is that?
+It answers one question: how many PRs did Qodo process, per user, and how many
+unique users is that?
 
 It works entirely from GitHub's search index (the `"Code Review by Qodo"
 in:comments` qualifier), so it makes one date-chunked search per org and never
@@ -96,8 +94,8 @@ def _rate_limit_reset_epoch() -> Optional[int]:
 def run_gh(args: List[str]) -> str:
     """Run `gh` and return stdout, retrying on rate limits and transient HTTP errors.
 
-    Exits the process on a hard (non-transient) failure — matching the parent
-    tool's behavior of failing loudly rather than producing a partial report.
+    Exits the process on a hard (non-transient) failure, so a broken run fails
+    loudly rather than producing a partial report.
     """
     cmd = ["gh"] + args
     rate_retried = False
