@@ -71,6 +71,9 @@ def markers_qualifier(markers: List[str]) -> str:
     union of the per-marker result counts), so a single search returns PRs
     carrying any marker and the searcher then de-dupes by PR.
     """
+    for marker in markers:
+        if '"' in marker or "\n" in marker or "\r" in marker:
+            raise ValueError("markers cannot contain double quotes or newlines")
     quoted = [f'"{m}"' for m in markers]
     if len(quoted) == 1:
         return f"{quoted[0]} in:comments"
@@ -629,6 +632,7 @@ def _output_stem(orgs: List[str], since: date, until: date, anonymize: Optional[
 
 
 def main():
+    global _REQUEST_SPACING_S
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -668,7 +672,14 @@ def main():
                         "users per PERIOD ('month' or 'week', bucketed by creation date).")
     p.add_argument("--output-dir", type=Path, default=REPORTS_DIR, metavar="DIR",
                    help="Directory to write CSVs into (default: reports/)")
+    p.add_argument("--request-spacing-seconds", type=float, default=_REQUEST_SPACING_S,
+                   metavar="SECONDS",
+                   help="Pause before each GitHub request (default: 0.5; use 0 to disable)")
     args = p.parse_args()
+
+    if args.request_spacing_seconds < 0:
+        p.error("--request-spacing-seconds must be >= 0")
+    _REQUEST_SPACING_S = args.request_spacing_seconds
 
     orgs = list(dict.fromkeys(args.org))  # de-dupe, preserve order
     if args.repos and len(orgs) > 1:
@@ -685,6 +696,10 @@ def main():
         p.error(f"--since ({since}) is after --until ({until})")
 
     markers = list(dict.fromkeys(args.marker)) if args.marker else list(DEFAULT_QODO_MARKERS)
+    try:
+        markers_qualifier(markers)
+    except ValueError as exc:
+        p.error(str(exc))
 
     validate_orgs(orgs, args.repos)
     check_token_scope()
