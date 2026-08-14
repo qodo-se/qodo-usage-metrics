@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Count Qodo-processed pull requests per user.
+How many active Qodo users do you have?
 
-A PR is "processed" if Qodo reviewed it — i.e. its comments carry a Qodo review
-heading (e.g. "Code Review by Qodo" or "PR Reviewer Guide"). Qodo may review a
-single PR more than once (e.g. on each push); this tool counts each PR exactly
-once regardless of how many Qodo reviews it received.
+This tool answers exactly that. It counts the distinct developers whose pull
+requests Qodo reviewed in a time window — that count is your active-user number
+— and also breaks it down per user (how many PRs Qodo reviewed for each).
 
-It answers one question: how many PRs did Qodo process, per user, and how many
-unique users is that?
+A PR counts as reviewed if Qodo left a review comment on it — matched by the
+heading Qodo writes (e.g. "Code Review by Qodo" or "PR Reviewer Guide"). Qodo
+may review a single PR more than once (e.g. on each push); each PR is counted
+exactly once regardless of how many reviews it received.
+
+A developer is "active" if Qodo reviewed at least one of their PRs in the
+window. (This is usage, not seats — it does not count people who have Qodo but
+opened no reviewed PR in the window.)
 
 It works entirely from GitHub's search index (a Qodo review marker matched
 `in:comments`), so it makes one date-chunked search per org and never fetches
@@ -733,13 +738,18 @@ def main():
     written = write_all(rows, stem, args.output_dir, by=args.by)
 
     by_user = aggregate_by_user(rows)
+    active_users = len(by_user)
     print()
-    print(f"Window (by PR creation date): {since} → {until}")
-    print(f"Orgs:              {', '.join(orgs)}")
-    print(f"Markers:           {', '.join(markers)}")
-    print(f"Scope:             {'merged PRs only' if args.merged_only else 'all reviewed PRs (any state)'}")
-    print(f"Processed PRs:     {len(rows)}")
-    print(f"Unique users:      {len(by_user)}")
+    print("=" * 44)
+    print(f"  Active Qodo users:   {active_users}")
+    print("=" * 44)
+    print(f"  Developers whose PRs Qodo reviewed,")
+    print(f"  {since} → {until}.")
+    print()
+    print(f"  Qodo-reviewed PRs:   {len(rows)}")
+    print(f"  Org(s):              {', '.join(orgs)}")
+    print(f"  Scope:               {'merged PRs only' if args.merged_only else 'all reviewed PRs (any state)'}")
+    print(f"  Markers:             {', '.join(markers)}")
     if args.by:
         print(f"\nBy {args.by} (bucketed by creation date):")
         for row in aggregate_by_period(rows, args.by):
