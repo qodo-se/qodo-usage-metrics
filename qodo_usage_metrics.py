@@ -63,6 +63,27 @@ REPORTS_DIR = Path("reports")
 DEFAULT_QODO_MARKERS = ("Code Review by Qodo", "PR Reviewer Guide")
 
 
+class InvalidMarker(ValueError):
+    """A marker string can't be represented as a GitHub search phrase."""
+
+
+def validate_markers(markers: List[str]) -> None:
+    """Reject markers that would corrupt the search query (data-quality guard).
+
+    Each marker is wrapped in double quotes and concatenated into the search
+    expression, and GitHub search phrases have no in-phrase quote escaping. A
+    marker containing a `"` (or a newline) would therefore break out of its
+    phrase and silently change which PRs match — an over/undercount with no
+    error. There is no safe way to escape it, so we fail loudly instead.
+    """
+    for m in markers:
+        if '"' in m or "\n" in m:
+            raise InvalidMarker(
+                f"marker {m!r} contains a double-quote or newline; GitHub search "
+                f"phrases can't escape those, so it would corrupt the count. "
+                f"Choose a marker substring without quotes or newlines.")
+
+
 def markers_qualifier(markers: List[str]) -> str:
     """Build the search term matching any of `markers` in a PR's comments.
 
@@ -70,7 +91,11 @@ def markers_qualifier(markers: List[str]) -> str:
     several. GitHub unions the phrases within one query (verified to equal the
     union of the per-marker result counts), so a single search returns PRs
     carrying any marker and the searcher then de-dupes by PR.
+
+    Raises InvalidMarker if any marker can't be safely quoted, so a bad `--marker`
+    can never silently skew the reported counts.
     """
+    validate_markers(markers)
     quoted = [f'"{m}"' for m in markers]
     if len(quoted) == 1:
         return f"{quoted[0]} in:comments"
@@ -685,6 +710,10 @@ def main():
         p.error(f"--since ({since}) is after --until ({until})")
 
     markers = list(dict.fromkeys(args.marker)) if args.marker else list(DEFAULT_QODO_MARKERS)
+    try:
+        validate_markers(markers)
+    except InvalidMarker as e:
+        p.error(str(e))
 
     validate_orgs(orgs, args.repos)
     check_token_scope()

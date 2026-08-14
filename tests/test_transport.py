@@ -142,6 +142,27 @@ def test_markers_qualifier_single_and_multi():
     assert markers_qualifier(["A", "B"]) == '("A" OR "B") in:comments'
 
 
+def test_markers_qualifier_rejects_quote_to_protect_the_count():
+    # A quote (or newline) in a marker would break out of the search phrase and
+    # silently change which PRs match — an over/undercount. It must fail loudly.
+    with pytest.raises(qum.InvalidMarker):
+        markers_qualifier(['Guide" OR "bug'])
+    with pytest.raises(qum.InvalidMarker):
+        markers_qualifier(["line1\nline2"])
+
+
+def test_search_rejects_bad_marker_before_any_query(monkeypatch):
+    # The guard must trip before any gh call is made, so a corrupt query is never
+    # sent to GitHub in the first place.
+    def boom(args):  # pragma: no cover - must never run
+        raise AssertionError("run_gh should not be called with an invalid marker")
+
+    monkeypatch.setattr(qum, "run_gh", boom)
+    with pytest.raises(qum.InvalidMarker):
+        list(search_processed_prs("acme", since=date(2026, 1, 1), until=date(2026, 1, 1),
+                                  markers=['bad"marker']))
+
+
 def test_search_unions_all_markers_in_one_query(monkeypatch):
     captured = {}
 
