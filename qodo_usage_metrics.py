@@ -20,7 +20,9 @@ It works entirely from GitHub's search index (a Qodo review marker matched
 individual PR bodies. Authentication is handled by the `gh` CLI — just make sure
 `gh auth status` shows you logged in with access to the org's repos.
 
-Output: CSV files only, written into ./reports/ (created automatically).
+Output: a run summary printed to the console with the headline "Active Qodo
+users" count, plus per-user CSV files written into ./reports/ (created
+automatically).
 
 Usage:
   # Default 90-day lookback, one org
