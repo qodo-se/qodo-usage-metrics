@@ -1,4 +1,9 @@
-"""Unit tests for the pure aggregation + anonymization logic (no network)."""
+"""Unit tests for the pure aggregation + anonymization logic (no network).
+
+The tool reports one thing — the distinct active users — so these tests assert
+on that set and its per-period breakouts, and that no per-PR review count leaks
+into any output.
+"""
 
 import json
 import os
@@ -10,78 +15,61 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import qodo_usage_metrics as qum  # noqa: E402
 from qodo_usage_metrics import (  # noqa: E402
-    aggregate_by_user, aggregate_by_period, aggregate_by_user_period,
-    period_key, build_anon_maps, apply_anonymization, search_processed_prs,
+    active_users, active_users_by_period, active_users_per_period,
+    period_key, anonymize_users, search_reviewed_prs,
 )
 
 
-def _row(user, org, repo, number, created_at="", merged_at=""):
-    return {
-        "org": org, "repo": repo, "pr_number": number, "pr_url": "", "state": "open",
-        "user": user, "created_at": created_at, "merged_at": merged_at,
-    }
+def _row(user, created_at=""):
+    return {"user": user, "created_at": created_at}
 
 
 SAMPLE = [
-    _row("alice", "acme", "frontend", 1),
-    _row("alice", "acme", "frontend", 2),
-    _row("bob", "acme", "backend", 3),
-    _row("alice", "acme", "backend", 4),
-    _row("carol", "widgets", "api", 5),
+    _row("alice"),
+    _row("alice"),
+    _row("bob"),
+    _row("alice"),
+    _row("carol"),
 ]
 
 
-def test_by_user_counts_each_pr_once():
-    counts = {r["user"]: r["processed_prs"] for r in aggregate_by_user(SAMPLE)}
-    assert counts == {"alice": 3, "bob": 1, "carol": 1}
+def test_active_users_are_distinct():
+    # alice's three reviewed PRs collapse to a single active-user entry.
+    assert active_users(SAMPLE) == ["alice", "bob", "carol"]
 
 
-def test_by_user_sorted_desc_then_alpha():
-    order = [r["user"] for r in aggregate_by_user(SAMPLE)]
-    assert order == ["alice", "bob", "carol"]  # bob/carol tie -> alphabetical
+def test_active_users_sorted_alphabetically():
+    assert active_users(SAMPLE) == sorted(active_users(SAMPLE))
 
 
-def test_unique_user_count_is_row_count():
-    assert len(aggregate_by_user(SAMPLE)) == 3
+def test_active_user_count_is_len_of_set():
+    assert len(active_users(SAMPLE)) == 3
 
 
-def test_duplicate_pr_rows_are_caller_responsibility():
-    # aggregate_by_user() trusts its input is already de-duped by the searcher;
-    # if the same PR appears twice it is counted twice. This guards the contract
-    # so a future change to the searcher's dedup surfaces here.
-    doubled = SAMPLE + [_row("alice", "acme", "frontend", 1)]
-    counts = {r["user"]: r["processed_prs"] for r in aggregate_by_user(doubled)}
-    assert counts["alice"] == 4
+def test_duplicate_rows_collapse_to_one_user():
+    # Even if the same PR's author appears many times, the user is counted once —
+    # active users are a set, not a PR tally.
+    doubled = SAMPLE + [_row("alice"), _row("alice")]
+    assert active_users(doubled) == ["alice", "bob", "carol"]
 
 
-def test_anonymize_all_is_stable_and_hides_identities():
-    user_map, org_map, repo_map = build_anon_maps(SAMPLE, "all")
-    anon = apply_anonymization(SAMPLE, user_map, org_map, repo_map)
-    # alice appears first -> user-01, and is applied consistently everywhere.
+def test_anonymize_is_stable_and_hides_identities():
+    anon, user_map = anonymize_users(SAMPLE)
+    # alice appears first -> user-01, applied consistently everywhere.
     assert user_map["alice"] == "user-01"
     assert all(r["user"].startswith("user-") for r in anon)
-    assert all(r["org"].startswith("org-") for r in anon)
-    assert all(r["repo"].startswith("repo-") for r in anon)
-    assert all(r["pr_url"] == "" for r in anon)
-    # Per-user counts are preserved under anonymization.
-    assert aggregate_by_user(anon)[0]["processed_prs"] == 3
-
-
-def test_anonymize_users_only_keeps_repos_visible():
-    user_map, org_map, repo_map = build_anon_maps(SAMPLE, "users")
-    anon = apply_anonymization(SAMPLE, user_map, org_map, repo_map)
-    assert anon[0]["user"].startswith("user-")
-    assert anon[0]["org"] == "acme"
-    assert anon[0]["repo"] == "frontend"
+    # The active-user count is preserved under anonymization.
+    assert len(active_users(anon)) == len(active_users(SAMPLE)) == 3
+    assert active_users(anon) == ["user-01", "user-02", "user-03"]
 
 
 # --- timeframe breakout ---------------------------------------------------- #
 
 DATED = [
-    _row("alice", "acme", "frontend", 1, created_at="2026-05-04T10:00:00Z"),  # Mon 2026-05-04
-    _row("bob", "acme", "frontend", 2, created_at="2026-05-06T10:00:00Z"),    # Wed, same week
-    _row("alice", "acme", "backend", 3, created_at="2026-06-30T23:59:59Z"),   # June
-    _row("carol", "widgets", "api", 4, created_at=""),                        # unknown period
+    _row("alice", created_at="2026-05-04T10:00:00Z"),  # Mon 2026-05-04
+    _row("bob", created_at="2026-05-06T10:00:00Z"),    # Wed, same week
+    _row("alice", created_at="2026-06-30T23:59:59Z"),  # June
+    _row("carol", created_at=""),                      # unknown period
 ]
 
 
@@ -93,42 +81,44 @@ def test_period_key_month_and_week():
     assert period_key("not-a-date", "week") == "unknown"
 
 
-def test_aggregate_by_period_month_counts_and_unique_users():
-    out = aggregate_by_period(DATED, "month")
-    by_period = {r["period"]: r for r in out}
-    assert by_period["2026-05"]["processed_prs"] == 2
-    assert by_period["2026-05"]["unique_users"] == 2   # alice + bob
-    assert by_period["2026-06"]["processed_prs"] == 1
-    assert by_period["2026-06"]["unique_users"] == 1
+def test_active_users_by_period_month():
+    out = active_users_by_period(DATED, "month")
+    by_period = {r["period"]: r["active_users"] for r in out}
+    assert by_period["2026-05"] == 2   # alice + bob
+    assert by_period["2026-06"] == 1
+    assert by_period["unknown"] == 1
     # chronological order, 'unknown' sorts last
     assert [r["period"] for r in out] == ["2026-05", "2026-06", "unknown"]
+    # only period + active_users columns — no PR count leaks in
+    assert all(set(r) == {"period", "active_users"} for r in out)
 
 
-def test_aggregate_by_period_week_groups_same_week():
-    out = aggregate_by_period(DATED, "week")
-    by_period = {r["period"]: r for r in out}
-    # alice(Mon) + bob(Wed) fall in the same ISO week -> one bucket of 2
-    assert by_period["2026-05-04"]["processed_prs"] == 2
-    assert by_period["2026-05-04"]["unique_users"] == 2
+def test_active_users_by_period_week_groups_same_week():
+    out = active_users_by_period(DATED, "week")
+    by_period = {r["period"]: r["active_users"] for r in out}
+    # alice(Mon) + bob(Wed) fall in the same ISO week -> one bucket of 2 users
+    assert by_period["2026-05-04"] == 2
 
 
-def test_aggregate_by_user_period():
-    out = aggregate_by_user_period(DATED, "month")
-    triples = {(r["period"], r["user"]): r["processed_prs"] for r in out}
-    assert triples[("2026-05", "alice")] == 1
-    assert triples[("2026-05", "bob")] == 1
-    assert triples[("2026-06", "alice")] == 1
-    assert triples[("unknown", "carol")] == 1
+def test_active_users_per_period_lists_distinct_users():
+    out = active_users_per_period(DATED, "month")
+    pairs = {(r["period"], r["user"]) for r in out}
+    assert ("2026-05", "alice") in pairs
+    assert ("2026-05", "bob") in pairs
+    assert ("2026-06", "alice") in pairs
+    assert ("unknown", "carol") in pairs
+    # rows are just (period, user) — no review counts
+    assert all(set(r) == {"period", "user"} for r in out)
 
 
-def test_unmerged_pr_counts_and_buckets_by_creation_date():
+def test_unmerged_pr_makes_its_author_active_and_buckets_by_creation_date():
     # The whole point of the default mode: a PR Qodo reviewed but never merged
-    # (no merge date) must still be counted, and bucketed by when it was opened
-    # — not dropped, and not dumped into 'unknown'.
-    rows = [_row("dave", "acme", "x", 9, created_at="2026-07-15T00:00:00Z", merged_at="")]
-    assert aggregate_by_user(rows) == [{"user": "dave", "processed_prs": 1}]
-    assert aggregate_by_period(rows, "month") == [
-        {"period": "2026-07", "processed_prs": 1, "unique_users": 1}
+    # (no merge date) must still make its author active, bucketed by when it was
+    # opened — not dropped, and not dumped into 'unknown'.
+    rows = [_row("dave", created_at="2026-07-15T00:00:00Z")]
+    assert active_users(rows) == ["dave"]
+    assert active_users_by_period(rows, "month") == [
+        {"period": "2026-07", "active_users": 1}
     ]
 
 
@@ -152,11 +142,8 @@ def _fake_gh_from_dataset(day_counts, monkeypatch):
             prs.append({
                 "number": n,
                 "repository": {"nameWithOwner": "acme/repo"},
-                "url": f"https://github.com/acme/repo/pull/{n}",
-                "state": "MERGED",
                 "author": {"login": "alice"},
                 "createdAt": f"{d}T12:00:00Z",
-                "mergedAt": f"{d}T13:00:00Z",
             })
 
     def fake_run_gh(args):
@@ -180,17 +167,17 @@ def _fake_gh_from_dataset(day_counts, monkeypatch):
 
 def test_auto_subdivide_recovers_every_pr(monkeypatch):
     # Cap of 5, one big initial window. Multiple days push several windows over
-    # the cap, forcing recursive splits. Every PR must come back exactly once.
+    # the cap, forcing recursive splits. Every PR must come back exactly once so
+    # the derived active-user evidence is complete.
     monkeypatch.setattr(qum, "SEARCH_RESULT_CAP", 5)
     day_counts = {
         "2026-01-01": 3, "2026-01-02": 1, "2026-01-04": 4,
         "2026-01-06": 4, "2026-01-08": 2,
     }
     all_prs = _fake_gh_from_dataset(day_counts, monkeypatch)
-    got = list(search_processed_prs(
+    got = list(search_reviewed_prs(
         "acme", since=date(2026, 1, 1), until=date(2026, 1, 8), chunk_days=30))
     assert len(got) == len(all_prs) == sum(day_counts.values())      # complete
-    assert len({(r["org"], r["repo"], r["pr_number"]) for r in got}) == len(got)  # no dupes
     assert {r["created_at"][:10] for r in got} == set(day_counts)    # right days
 
 
@@ -200,7 +187,7 @@ def test_single_day_over_cap_warns_but_still_yields(monkeypatch, capsys):
     # returning a short count as if it were complete.
     monkeypatch.setattr(qum, "SEARCH_RESULT_CAP", 5)
     _fake_gh_from_dataset({"2026-02-03": 9}, monkeypatch)
-    got = list(search_processed_prs(
+    got = list(search_reviewed_prs(
         "acme", since=date(2026, 2, 3), until=date(2026, 2, 3), chunk_days=30))
     assert len(got) == 5  # truncated to the cap — the irreducible undercount
     assert "can't be split further" in capsys.readouterr().err
@@ -210,7 +197,7 @@ def test_window_under_cap_is_not_split(monkeypatch, capsys):
     # Below the cap there should be no split line at all — just one search.
     monkeypatch.setattr(qum, "SEARCH_RESULT_CAP", 1000)
     _fake_gh_from_dataset({"2026-03-01": 3, "2026-03-02": 2}, monkeypatch)
-    got = list(search_processed_prs(
+    got = list(search_reviewed_prs(
         "acme", since=date(2026, 3, 1), until=date(2026, 3, 2), chunk_days=30))
     assert len(got) == 5
     assert "splitting" not in capsys.readouterr().err

@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import qodo_usage_metrics as qum  # noqa: E402
 from qodo_usage_metrics import (  # noqa: E402
-    classify_rate_limit, markers_qualifier, search_processed_prs,
+    classify_rate_limit, markers_qualifier, search_reviewed_prs,
 )
 
 
@@ -159,7 +159,7 @@ def test_search_rejects_bad_marker_before_any_query(monkeypatch):
 
     monkeypatch.setattr(qum, "run_gh", boom)
     with pytest.raises(qum.InvalidMarker):
-        list(search_processed_prs("acme", since=date(2026, 1, 1), until=date(2026, 1, 1),
+        list(search_reviewed_prs("acme", since=date(2026, 1, 1), until=date(2026, 1, 1),
                                   markers=['bad"marker']))
 
 
@@ -175,7 +175,7 @@ def test_search_unions_all_markers_in_one_query(monkeypatch):
         }}})
 
     monkeypatch.setattr(qum, "run_gh", fake_run_gh)
-    list(search_processed_prs("acme", since=date(2026, 1, 1), until=date(2026, 1, 1),
+    list(search_reviewed_prs("acme", since=date(2026, 1, 1), until=date(2026, 1, 1),
                               markers=["Foo Marker", "Bar Marker"]))
     assert '("Foo Marker" OR "Bar Marker") in:comments' in captured["q"]
 
@@ -192,6 +192,6 @@ def test_search_defaults_to_both_qodo_markers(monkeypatch):
         }}})
 
     monkeypatch.setattr(qum, "run_gh", fake_run_gh)
-    list(search_processed_prs("acme", since=date(2026, 1, 1), until=date(2026, 1, 1)))
+    list(search_reviewed_prs("acme", since=date(2026, 1, 1), until=date(2026, 1, 1)))
     for marker in qum.DEFAULT_QODO_MARKERS:
         assert f'"{marker}"' in captured["q"]

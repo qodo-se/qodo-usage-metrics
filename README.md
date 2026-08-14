@@ -2,14 +2,18 @@
 
 **How many people are actually using Qodo?**
 
-This tool prints one number: your **active Qodo users** — the distinct
-developers whose pull requests Qodo reviewed in a time window.
+This tool prints one number and one list — nothing else: your **active Qodo
+users**, the distinct developers whose pull requests Qodo reviewed in a time
+window, and who they are.
 
 ```
 ============================================
   Active Qodo users:   42
 ============================================
 ```
+
+It does **not** report how many PRs Qodo reviewed, per user or in total — active
+users are the whole point, so that's all it returns.
 
 ## Getting started
 
@@ -40,9 +44,12 @@ step 1.
 ## Want more?
 
 - **A different window:** add `--days 30` (default is 90).
-- **Share it outside your company:** add `--anonymize` to replace names with
-  pseudonyms.
-- **Everything else** (date ranges, per-repo scope, monthly breakouts, CSV
-  output): run `python3 qodo_usage_metrics.py --help`.
+- **Share it outside your company:** add `--anonymize` to replace usernames with
+  stable pseudonyms (the count is unchanged).
+- **Active users over time:** add `--by month` (or `--by week`) for a per-period
+  active-user breakout.
+- **Everything else** (date ranges, per-repo scope): run
+  `python3 qodo_usage_metrics.py --help`.
 
-Full per-user detail is also written to CSV files in `reports/`.
+The active users are also written to `reports/…_active_users.csv` — one row per
+user, so the row count equals the number above.

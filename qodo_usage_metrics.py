@@ -2,18 +2,18 @@
 """
 How many active Qodo users do you have?
 
-This tool answers exactly that. It counts the distinct developers whose pull
-requests Qodo reviewed in a time window — that count is your active-user number
-— and also breaks it down per user (how many PRs Qodo reviewed for each).
-
-A PR counts as reviewed if Qodo left a review comment on it — matched by the
-heading Qodo writes (e.g. "Code Review by Qodo" or "PR Reviewer Guide"). Qodo
-may review a single PR more than once (e.g. on each push); each PR is counted
-exactly once regardless of how many reviews it received.
+This tool answers exactly that, and nothing else. It counts the distinct
+developers whose pull requests Qodo reviewed in a time window — that count is
+your active-user number — and lists who they are. It does not report per-user or
+per-PR review counts: the only thing it returns is active users.
 
 A developer is "active" if Qodo reviewed at least one of their PRs in the
-window. (This is usage, not seats — it does not count people who have Qodo but
-opened no reviewed PR in the window.)
+window. A PR counts as reviewed if Qodo left a review comment on it — matched by
+the heading Qodo writes (e.g. "Code Review by Qodo" or "PR Reviewer Guide").
+Qodo may review a single PR more than once (e.g. on each push) and a developer
+may have many reviewed PRs; either way the developer is counted once. (This is
+usage, not seats — it does not count people who have Qodo but opened no reviewed
+PR in the window.)
 
 It works entirely from GitHub's search index (a Qodo review marker matched
 `in:comments`), so it makes one date-chunked search per org and never fetches
@@ -21,8 +21,9 @@ individual PR bodies. Authentication is handled by the `gh` CLI — just make su
 `gh auth status` shows you logged in with access to the org's repos.
 
 Output: a run summary printed to the console with the headline "Active Qodo
-users" count, plus per-user CSV files written into ./reports/ (created
-automatically).
+users" count, plus an active-user CSV written into ./reports/ (created
+automatically). With --by, two per-period breakout CSVs are written alongside it
+(active-user count per period, and which users were active in each period).
 
 Usage:
   # Default 90-day lookback, one org
@@ -38,10 +39,10 @@ Usage:
   # Scope to specific repos within a single org
   python3 qodo_usage_metrics.py --org acme-corp --repos frontend-app backend-api
 
-  # Timeframe breakout: usage and unique users per month (or per week)
+  # Timeframe breakout: active users per month (or per week)
   python3 qodo_usage_metrics.py --org acme-corp --by month
 
-  # Anonymize users and/or repos for external sharing
+  # Anonymize users for external sharing
   python3 qodo_usage_metrics.py --org acme-corp --anonymize
 """
 
@@ -52,7 +53,6 @@ import re
 import subprocess
 import sys
 import time
-from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional
@@ -65,8 +65,8 @@ REPORTS_DIR = Path("reports")
 #   - "Code Review by Qodo" — the newer agentic / Qodo Merge review
 #   - "PR Reviewer Guide"   — the classic Qodo Merge / PR-Agent `/review` output
 # A PR counts if ANY marker appears in its comments (the markers are unioned into
-# one search and the PR is de-duped), so the number reflects reviews from either
-# surface. Deployments whose heading differs can override the set with --marker.
+# one search and the PR is de-duped), so an active user is anyone Qodo reviewed
+# on either surface. Deployments whose heading differs can override with --marker.
 DEFAULT_QODO_MARKERS = ("Code Review by Qodo", "PR Reviewer Guide")
 
 
@@ -80,8 +80,9 @@ def validate_markers(markers: List[str]) -> None:
     Each marker is wrapped in double quotes and concatenated into the search
     expression, and GitHub search phrases have no in-phrase quote escaping. A
     marker containing a `"` (or a newline) would therefore break out of its
-    phrase and silently change which PRs match — an over/undercount with no
-    error. There is no safe way to escape it, so we fail loudly instead.
+    phrase and silently change which PRs match — which would silently add or
+    drop active users with no error. There is no safe way to escape it, so we
+    fail loudly instead.
     """
     for m in markers:
         if '"' in m or "\n" in m:
@@ -100,7 +101,7 @@ def markers_qualifier(markers: List[str]) -> str:
     carrying any marker and the searcher then de-dupes by PR.
 
     Raises InvalidMarker if any marker can't be safely quoted, so a bad `--marker`
-    can never silently skew the reported counts.
+    can never silently skew who counts as active.
     """
     validate_markers(markers)
     quoted = [f'"{m}"' for m in markers]
@@ -108,7 +109,9 @@ def markers_qualifier(markers: List[str]) -> str:
         return f"{quoted[0]} in:comments"
     return f'({" OR ".join(quoted)}) in:comments'
 
-# GraphQL search returning only the fields the slim report needs.
+# GraphQL search returning only the fields deriving the active-user set needs:
+# the repo + number to de-dupe a PR, the author (the active user), and the
+# creation date (for the optional per-period breakout).
 _GQL_SEARCH_QUERY = (
     "query($q:String!,$cursor:String){"
     "search(query:$q,type:ISSUE,first:100,after:$cursor){"
@@ -117,10 +120,8 @@ _GQL_SEARCH_QUERY = (
     "nodes{...on PullRequest{"
     "number "
     "repository{nameWithOwner} "
-    "url "
-    "state "
     "author{login} "
-    "createdAt mergedAt"
+    "createdAt"
     "}}}}"
 )
 
@@ -169,7 +170,7 @@ UNKNOWN_USER = "(unknown)"
 # GitHub's Search API returns at most this many results for any single query,
 # no matter how you paginate. A date window with more matches than this is
 # truncated, so the tool splits such a window in half and re-searches each side
-# until every sub-window is under the cap (see search_processed_prs).
+# until every sub-window is under the cap (see search_reviewed_prs).
 SEARCH_RESULT_CAP = 1000
 
 
@@ -282,7 +283,7 @@ def run_gh(args: List[str]) -> str:
 # Search
 # --------------------------------------------------------------------------- #
 
-def search_processed_prs(
+def search_reviewed_prs(
     org: str,
     since: date,
     until: Optional[date] = None,
@@ -291,14 +292,18 @@ def search_processed_prs(
     merged_only: bool = False,
     markers: Optional[List[str]] = None,
 ) -> Iterator[dict]:
-    """Yield one dict per Qodo-processed PR created in [since, until] for `org`.
+    """Yield one row per Qodo-reviewed PR created in [since, until] for `org`.
 
-    A PR is "processed" if Qodo reviewed it — a `<marker> in:comments` qualifier
-    returns exactly those, no per-PR fetch required. `markers` defaults to
-    DEFAULT_QODO_MARKERS and a PR matching any of them counts once. By
-    default every reviewed PR is yielded regardless of state (open, merged, or
-    closed-unmerged) so the unique-user count reflects everyone Qodo reviewed;
-    pass `merged_only=True` to restrict to merged PRs.
+    These rows are the evidence the active-user set is derived from — they are
+    NOT reported per-PR. Each row carries only the PR's author (the active user)
+    and its creation date; PR numbers/URLs/state are not retained.
+
+    A PR is "reviewed" if Qodo commented on it — a `<marker> in:comments`
+    qualifier returns exactly those, no per-PR fetch required. `markers` defaults
+    to DEFAULT_QODO_MARKERS and a PR matching any of them counts once. By default
+    every reviewed PR is included regardless of state (open, merged, or
+    closed-unmerged) so the active-user count reflects everyone Qodo reviewed;
+    pass `merged_only=True` to count a developer active only via a merged PR.
 
     The window filters on PR *creation* date (`created:`), which every PR has —
     unlike merge date, which unmerged PRs lack. Each PR is yielded at most once
@@ -308,9 +313,9 @@ def search_processed_prs(
     results. `chunk_days` sets the *initial* window size, but a window whose
     match count still exceeds the cap is **automatically split in half and
     re-searched**, recursively, until every sub-window is under the cap — so the
-    count is complete regardless of `chunk_days`. The only irreducible case is a
-    single calendar day with more than 1000 reviewed PRs (which date-chunking
-    can't split further); that alone prints a loud warning.
+    active-user set is complete regardless of `chunk_days`. The only irreducible
+    case is a single calendar day with more than 1000 reviewed PRs (which
+    date-chunking can't split further); that alone prints a loud warning.
     """
     qualifiers = [f"repo:{org}/{r}" for r in repos] if repos else [f"org:{org}"]
     end = until if until is not None else date.today()
@@ -328,14 +333,8 @@ def search_processed_prs(
             return None
         seen.add(key)
         return {
-            "org": owner,
-            "repo": repo,
-            "pr_number": node["number"],
-            "pr_url": node.get("url", ""),
-            "state": (node.get("state") or "").lower(),
             "user": (node.get("author") or {}).get("login") or UNKNOWN_USER,
             "created_at": node.get("createdAt", ""),
-            "merged_at": node.get("mergedAt", ""),
         }
 
     def _search_window(qual: str, qual_label: str, w_start: date, w_end: date,
@@ -390,7 +389,8 @@ def search_processed_prs(
             # returning a truncated slice.
             print(f"{indent}Warning: {w_start} alone has {issue_count} matches "
                   f"(> {SEARCH_RESULT_CAP} cap) for {qual_label}; a single day "
-                  f"can't be split further, so some PRs are missing from it.",
+                  f"can't be split further, so some active users may be missing "
+                  f"from it.",
                   file=sys.stderr)
 
     cursor = since
@@ -406,19 +406,14 @@ def search_processed_prs(
 # Aggregation (pure — unit-tested)
 # --------------------------------------------------------------------------- #
 
-def aggregate_by_user(rows: List[dict]) -> List[dict]:
-    """Roll processed-PR rows up into a per-user count.
+def active_users(rows: List[dict]) -> List[str]:
+    """The distinct developers Qodo reviewed, sorted alphabetically.
 
-    Every PR counts once (the searcher de-dupes by PR, so a PR Qodo reviewed
-    multiple times is still one row here). Sorted with the largest counts first,
-    ties broken alphabetically. The length of the returned list is the number of
-    unique users.
+    This is the tool's single output metric: a PR Qodo reviewed many times, and a
+    developer with many reviewed PRs, each collapse to one entry here. The length
+    of the returned list is the active-user count.
     """
-    by_user: Counter = Counter(r["user"] for r in rows)
-    return [
-        {"user": u, "processed_prs": c}
-        for u, c in sorted(by_user.items(), key=lambda kv: (-kv[1], kv[0]))
-    ]
+    return sorted({r["user"] for r in rows})
 
 
 UNKNOWN_PERIOD = "unknown"
@@ -444,39 +439,36 @@ def period_key(iso_ts: str, by: str) -> str:
     raise ValueError(f"unknown period: {by!r}")
 
 
-def aggregate_by_period(rows: List[dict], by: str) -> List[dict]:
-    """Per-period processed-PR and unique-user counts, ordered chronologically.
+def active_users_by_period(rows: List[dict], by: str) -> List[dict]:
+    """Per-period active-user counts, ordered chronologically.
 
-    PRs are bucketed by creation date (every PR has one; unmerged PRs have no
-    merge date). 'unknown' (if any) sorts last.
+    Users are bucketed by their PR's creation date (every PR has one; unmerged
+    PRs have no merge date). A user active in two periods counts once in each.
+    'unknown' (if any) sorts last.
     """
-    prs: Counter = Counter()
     users: Dict[str, set] = {}
     for r in rows:
         p = period_key(r.get("created_at", ""), by)
-        prs[p] += 1
         users.setdefault(p, set()).add(r["user"])
     return [
-        {"period": p, "processed_prs": prs[p], "unique_users": len(users[p])}
-        for p in sorted(prs, key=lambda p: (p == UNKNOWN_PERIOD, p))
+        {"period": p, "active_users": len(users[p])}
+        for p in sorted(users, key=lambda p: (p == UNKNOWN_PERIOD, p))
     ]
 
 
-def aggregate_by_user_period(rows: List[dict], by: str) -> List[dict]:
-    """Per-user, per-period processed-PR counts.
+def active_users_per_period(rows: List[dict], by: str) -> List[dict]:
+    """The distinct active users in each period, as (period, user) rows.
 
-    Ordered by period (chronological, 'unknown' last), then by count descending,
-    then user alphabetically. PRs are bucketed by creation date.
+    Ordered by period (chronological, 'unknown' last), then user alphabetically.
+    Users are bucketed by their PR's creation date.
     """
-    counts: Counter = Counter()
+    pairs = set()
     for r in rows:
-        counts[(period_key(r.get("created_at", ""), by), r["user"])] += 1
+        pairs.add((period_key(r.get("created_at", ""), by), r["user"]))
     return [
-        {"period": p, "user": u, "processed_prs": c}
-        for (p, u), c in sorted(
-            counts.items(),
-            key=lambda kv: (kv[0][0] == UNKNOWN_PERIOD, kv[0][0], -kv[1], kv[0][1]),
-        )
+        {"period": p, "user": u}
+        for (p, u) in sorted(
+            pairs, key=lambda pu: (pu[0] == UNKNOWN_PERIOD, pu[0], pu[1]))
     ]
 
 
@@ -484,55 +476,28 @@ def aggregate_by_user_period(rows: List[dict], by: str) -> List[dict]:
 # Anonymization (pure — unit-tested)
 # --------------------------------------------------------------------------- #
 
-def build_anon_maps(rows: List[dict], scope: str):
-    """Build stable user/org/repo pseudonym maps for the given scope.
+def anonymize_users(rows: List[dict]):
+    """Return (new_rows, user_map) with usernames replaced by stable pseudonyms.
 
-    scope: 'users' pseudonymizes the user column only; 'repos' pseudonymizes
-    org + repo columns; 'all' does both. Names are assigned in first-appearance
-    order so the mapping is deterministic for a given input ordering.
+    Pseudonyms are `user-01`, `user-02`, … assigned in first-appearance order, so
+    the mapping is deterministic for a given input ordering. The active-user
+    count and per-period breakouts are identical before and after — only the
+    identity is hidden — so an anonymized run is safe to share outside the org.
     """
     user_map: Dict[str, str] = {}
-    org_map: Dict[str, str] = {}
-    repo_map: Dict[str, str] = {}  # keyed by "org/repo"
-    do_users = scope in ("users", "all")
-    do_repos = scope in ("repos", "all")
-    for r in rows:
-        if do_users and r["user"] not in user_map:
-            user_map[r["user"]] = f"user-{len(user_map) + 1:02d}"
-        if do_repos:
-            if r["org"] not in org_map:
-                org_map[r["org"]] = f"org-{len(org_map) + 1:02d}"
-            full = f"{r['org']}/{r['repo']}"
-            if full not in repo_map:
-                repo_map[full] = f"repo-{len(repo_map) + 1:02d}"
-    return user_map, org_map, repo_map
-
-
-def apply_anonymization(rows: List[dict], user_map, org_map, repo_map) -> List[dict]:
-    """Return new rows with identifying columns replaced by their pseudonyms.
-
-    Anonymized repos also drop the PR URL (it leaks the real org/repo/number).
-    """
     out = []
     for r in rows:
+        if r["user"] not in user_map:
+            user_map[r["user"]] = f"user-{len(user_map) + 1:02d}"
         nr = dict(r)
-        if user_map:
-            nr["user"] = user_map.get(r["user"], r["user"])
-        if repo_map:
-            full = f"{r['org']}/{r['repo']}"
-            nr["repo"] = repo_map.get(full, r["repo"])
-            nr["org"] = org_map.get(r["org"], r["org"])
-            nr["pr_url"] = ""
+        nr["user"] = user_map[r["user"]]
         out.append(nr)
-    return out
+    return out, user_map
 
 
 # --------------------------------------------------------------------------- #
 # Output
 # --------------------------------------------------------------------------- #
-
-RAW_COLUMNS = ["org", "repo", "pr_number", "pr_url", "state", "user", "created_at", "merged_at"]
-
 
 def _write_csv(path: Path, columns: List[str], rows: Iterable[dict]) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -543,37 +508,34 @@ def _write_csv(path: Path, columns: List[str], rows: Iterable[dict]) -> None:
 
 def write_all(rows: List[dict], stem: str, out_dir: Path,
               by: Optional[str] = None) -> List[Path]:
-    """Write the per-user count CSV plus the raw per-PR evidence CSV.
+    """Write the active-user CSV (and optional per-period breakouts).
 
-    When `by` is 'month' or 'week', also writes per-period breakouts:
-    `_by_{by}.csv` (period totals + unique users) and `_by_user_{by}.csv`
-    (per-user counts per period).
+    `{stem}_active_users.csv` is the headline report: one `user` column, one row
+    per active user — its row count is the active-user number. When `by` is
+    'month' or 'week', also writes `{stem}_active_users_by_{by}.csv` (active-user
+    count per period) and `{stem}_active_users_per_{by}.csv` (which users were
+    active in each period). No per-PR file is written — active users are the only
+    thing this tool reports.
 
-    Returns the written paths. by_user is the headline report; the raw file is
-    the underlying processed-PR list, kept for traceability.
+    Returns the written paths.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
 
-    by_user_path = out_dir / f"{stem}_by_user.csv"
-    _write_csv(by_user_path, ["user", "processed_prs"], aggregate_by_user(rows))
-    written.append(by_user_path)
+    users_path = out_dir / f"{stem}_active_users.csv"
+    _write_csv(users_path, ["user"], ({"user": u} for u in active_users(rows)))
+    written.append(users_path)
 
     if by:
-        period_path = out_dir / f"{stem}_by_{by}.csv"
-        _write_csv(period_path, ["period", "processed_prs", "unique_users"],
-                   aggregate_by_period(rows, by))
+        period_path = out_dir / f"{stem}_active_users_by_{by}.csv"
+        _write_csv(period_path, ["period", "active_users"],
+                   active_users_by_period(rows, by))
         written.append(period_path)
 
-        user_period_path = out_dir / f"{stem}_by_user_{by}.csv"
-        _write_csv(user_period_path, ["period", "user", "processed_prs"],
-                   aggregate_by_user_period(rows, by))
-        written.append(user_period_path)
-
-    raw_path = out_dir / f"{stem}_processed_prs.csv"
-    _write_csv(raw_path, RAW_COLUMNS,
-               sorted(rows, key=lambda r: (r["org"], r["repo"], r["pr_number"])))
-    written.append(raw_path)
+        per_period_path = out_dir / f"{stem}_active_users_per_{by}.csv"
+        _write_csv(per_period_path, ["period", "user"],
+                   active_users_per_period(rows, by))
+        written.append(per_period_path)
 
     return written
 
@@ -611,8 +573,8 @@ def check_token_scope() -> None:
 def validate_orgs(orgs: List[str], repos: Optional[List[str]] = None) -> None:
     """Fail loudly on an org login that can't be resolved, warn on non-orgs.
 
-    A typo'd or inaccessible org otherwise yields a clean-looking "0 processed
-    PRs" report with exit 0 — the worst failure mode for a shared tool.
+    A typo'd or inaccessible org otherwise yields a clean-looking "0 active
+    users" report with exit 0 — the worst failure mode for a shared tool.
 
     The non-Organization warning is suppressed when `repos` is given: a
     `--repos` run searches with `repo:owner/name` qualifiers, which resolve for
@@ -644,7 +606,7 @@ def validate_orgs(orgs: List[str], repos: Optional[List[str]] = None) -> None:
                     f"{stderr}")
             print(f"  Warning: couldn't complete the pre-flight check for org "
                   f"'{org}' (likely transient); continuing. If the run finds no "
-                  f"PRs, re-verify the org name.\n    {stderr}", file=sys.stderr)
+                  f"active users, re-verify the org name.\n    {stderr}", file=sys.stderr)
             continue
         kind = out.stdout.strip()
         if kind != "Organization" and not repos:
@@ -654,7 +616,7 @@ def validate_orgs(orgs: List[str], repos: Optional[List[str]] = None) -> None:
                   file=sys.stderr)
 
 
-def _output_stem(orgs: List[str], since: date, until: date, anonymize: Optional[str]) -> str:
+def _output_stem(orgs: List[str], since: date, until: date, anonymize: bool) -> str:
     org_part = orgs[0] if len(orgs) == 1 else f"{len(orgs)}orgs"
     suffix = "_anon" if anonymize else ""
     return f"{org_part}_{since.isoformat()}_{until.isoformat()}{suffix}"
@@ -682,22 +644,22 @@ def main():
                         "automatically, so this only tunes performance, not "
                         "completeness.")
     p.add_argument("--merged-only", action="store_true",
-                   help="Count only merged PRs. Default counts every PR Qodo "
-                        "reviewed regardless of state (open/merged/closed).")
+                   help="Count a developer active only if Qodo reviewed a merged "
+                        "PR of theirs. Default counts any reviewed PR regardless "
+                        "of state (open/merged/closed).")
     p.add_argument("--marker", nargs="+", metavar="TEXT", default=None,
                    help="Comment heading(s) that identify a Qodo review; a PR "
                         "counts if any appears in its comments. Default: "
                         + " and ".join(f'\"{m}\"' for m in DEFAULT_QODO_MARKERS)
                         + ". Override if your Qodo deployment writes a different "
                           "heading.")
-    p.add_argument("--anonymize", nargs="?", const="all", default=None,
-                   choices=["all", "users", "repos"], metavar="SCOPE",
-                   help="Replace identifying data with stable pseudonyms. "
-                        "SCOPE: 'users', 'repos', or omit to anonymize both. "
-                        "Output filenames get an _anon suffix.")
+    p.add_argument("--anonymize", action="store_true",
+                   help="Replace usernames with stable pseudonyms (user-01, …) "
+                        "for external sharing. The active-user count is "
+                        "unchanged. Output filenames get an _anon suffix.")
     p.add_argument("--by", choices=["month", "week"], default=None, metavar="PERIOD",
-                   help="Also emit a timeframe breakout of processed PRs and unique "
-                        "users per PERIOD ('month' or 'week', bucketed by creation date).")
+                   help="Also emit a timeframe breakout of active users per PERIOD "
+                        "('month' or 'week', bucketed by PR creation date).")
     p.add_argument("--output-dir", type=Path, default=REPORTS_DIR, metavar="DIR",
                    help="Directory to write CSVs into (default: reports/)")
     args = p.parse_args()
@@ -728,41 +690,37 @@ def main():
     rows: List[dict] = []
     for org in orgs:
         print(f"\nOrg: {org}", file=sys.stderr)
-        rows.extend(search_processed_prs(
+        rows.extend(search_reviewed_prs(
             org, since, until, repos=args.repos, chunk_days=args.chunk_days,
             merged_only=args.merged_only, markers=markers))
 
     if args.anonymize:
-        user_map, org_map, repo_map = build_anon_maps(rows, args.anonymize)
-        rows = apply_anonymization(rows, user_map, org_map, repo_map)
+        rows, _ = anonymize_users(rows)
 
     stem = _output_stem(orgs, since, until, args.anonymize)
     written = write_all(rows, stem, args.output_dir, by=args.by)
 
-    by_user = aggregate_by_user(rows)
-    active_users = len(by_user)
+    active = active_users(rows)
     print()
     print("=" * 44)
-    print(f"  Active Qodo users:   {active_users}")
+    print(f"  Active Qodo users:   {len(active)}")
     print("=" * 44)
     print(f"  Developers whose PRs Qodo reviewed,")
     print(f"  {since} → {until}.")
     print()
-    print(f"  Qodo-reviewed PRs:   {len(rows)}")
     print(f"  Org(s):              {', '.join(orgs)}")
     print(f"  Scope:               {'merged PRs only' if args.merged_only else 'all reviewed PRs (any state)'}")
     print(f"  Markers:             {', '.join(markers)}")
     if args.by:
-        print(f"\nBy {args.by} (bucketed by creation date):")
-        for row in aggregate_by_period(rows, args.by):
-            print(f"  {row['period']:<10} {row['processed_prs']:>4} PRs   "
-                  f"{row['unique_users']:>3} users")
+        print(f"\nActive users by {args.by} (bucketed by PR creation date):")
+        for row in active_users_by_period(rows, args.by):
+            print(f"  {row['period']:<10} {row['active_users']:>3} users")
     print("\nCSVs written:")
     for path in written:
         print(f"  {path}")
 
     if not rows:
-        print("\n  WARNING: 0 matching PRs found — this is probably not what you "
+        print("\n  WARNING: 0 active users found — this is probably not what you "
               "want. Likely causes:\n"
               "    - wrong --org (typo) or no access to its private repos\n"
               "    - gh token missing the 'repo' scope (see any warning above)\n"
