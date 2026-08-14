@@ -228,7 +228,7 @@ def search_processed_prs(
         search = json.loads(run_gh(gh_args))["data"]["search"]
         issue_count = search.get("issueCount", 0)
 
-        if issue_count >= SEARCH_RESULT_CAP and w_start < w_end:
+        if issue_count > SEARCH_RESULT_CAP and w_start < w_end:
             print(f"{indent}Searching {qual_label}  {w_start} .. {w_end} ... "
                   f"{issue_count} hits > {SEARCH_RESULT_CAP} cap — splitting",
                   file=sys.stderr, flush=True)
@@ -254,10 +254,12 @@ def search_processed_prs(
                        "-f", f"q={q}", "-f", f"cursor={end_cursor}"]
             search = json.loads(run_gh(gh_args))["data"]["search"]
         print(f" {count} PRs", file=sys.stderr)
-        if issue_count >= SEARCH_RESULT_CAP:
+        if issue_count > SEARCH_RESULT_CAP:
             # A single day still over the cap: date-chunking can't split further.
-            # This is the one residual undercount, so fail loudly rather than
-            # quietly returning a truncated slice.
+            # (Exactly SEARCH_RESULT_CAP is fine — those results are all
+            # retrievable; only a strictly larger total truncates.) This is the
+            # one residual undercount, so fail loudly rather than quietly
+            # returning a truncated slice.
             print(f"{indent}Warning: {w_start} alone has {issue_count} matches "
                   f"(> {SEARCH_RESULT_CAP} cap) for {qual_label}; a single day "
                   f"can't be split further, so some PRs are missing from it.",

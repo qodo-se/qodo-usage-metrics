@@ -163,10 +163,15 @@ def _fake_gh_from_dataset(day_counts, monkeypatch):
         q = next(a[2:] for a in args if a.startswith("q="))
         lo, hi = _CREATED_RE.search(q).groups()
         in_window = [p for p in prs if lo <= p["createdAt"][:10] <= hi]
+        # Faithful to GitHub: issueCount is the true total, but no query can
+        # return more than the cap — so a window over the cap comes back
+        # TRUNCATED. Without this, a window served whole would let the code
+        # recover every PR even if subdivision were broken, so the test would
+        # pass for the wrong reason.
         return json.dumps({"data": {"search": {
             "issueCount": len(in_window),
             "pageInfo": {"hasNextPage": False, "endCursor": None},
-            "nodes": in_window,
+            "nodes": in_window[:qum.SEARCH_RESULT_CAP],
         }}})
 
     monkeypatch.setattr(qum, "run_gh", fake_run_gh)
@@ -190,13 +195,14 @@ def test_auto_subdivide_recovers_every_pr(monkeypatch):
 
 
 def test_single_day_over_cap_warns_but_still_yields(monkeypatch, capsys):
-    # A single day over the cap can't be split further: the tool must still yield
-    # what it can AND warn loudly, rather than silently returning a short count.
+    # A single day over the cap can't be split further: the tool must yield the
+    # cap's worth (all GitHub will return) AND warn loudly, rather than silently
+    # returning a short count as if it were complete.
     monkeypatch.setattr(qum, "SEARCH_RESULT_CAP", 5)
     _fake_gh_from_dataset({"2026-02-03": 9}, monkeypatch)
     got = list(search_processed_prs(
         "acme", since=date(2026, 2, 3), until=date(2026, 2, 3), chunk_days=30))
-    assert len(got) == 9
+    assert len(got) == 5  # truncated to the cap — the irreducible undercount
     assert "can't be split further" in capsys.readouterr().err
 
 
