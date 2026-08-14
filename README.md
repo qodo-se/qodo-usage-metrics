@@ -87,7 +87,7 @@ python3 qodo_usage_metrics.py --org acme-corp --merged-only
 | `--repos` | Limit to specific repos — only valid with a single `--org`. |
 | `--merged-only` | Count only merged PRs. Default counts every reviewed PR regardless of state (open/merged/closed). |
 | `--by {month,week}` | Also emit a timeframe breakout — processed PRs and unique users per period (bucketed by creation date; weeks start Monday). |
-| `--chunk-days` | Date-window size per search query (default: `30`). Lower it if a run warns the 1000-result search cap was hit. |
+| `--chunk-days` | **Initial** date-window size per search query (default: `30`). Any window that exceeds GitHub's 1000-result search cap is split in half and re-searched automatically, so this only affects performance, not completeness. |
 | `--anonymize [SCOPE]` | Replace identifying data with stable pseudonyms. `SCOPE`: `users`, `repos`, or omit for both. Anonymized repos also drop the PR URL. |
 | `--output-dir` | Directory to write CSVs into (default: `reports/`). |
 
