@@ -10,10 +10,20 @@ It just counts **processed PRs per user** and writes plain CSVs.
 
 ## What "processed" means
 
-A PR is **processed** if Qodo reviewed it — it carries at least one
-`Code Review by Qodo` comment. Qodo can review a single PR more than once
-(for example on each new push); **each PR is counted exactly once** regardless
-of how many Qodo reviews it received.
+A PR is **processed** if Qodo reviewed it — its comments carry a Qodo review
+heading. Qodo's review surfaces use different headings, so by default the tool
+matches **either** of:
+
+- `Code Review by Qodo` — the newer agentic / Qodo Merge review
+- `PR Reviewer Guide` — the classic Qodo Merge / PR-Agent `/review` output
+
+A PR counts if **any** marker appears in its comments (the markers are unioned
+into a single search, and each PR is counted **exactly once** regardless of how
+many Qodo reviews — or how many matching headings — it received). If your
+deployment writes a different heading, override the set with `--marker`. Getting
+this wrong is the main way to *undercount*: a run that matches the wrong heading
+reports far fewer PRs than Qodo actually reviewed, so the run summary echoes the
+active `Markers:` for auditability.
 
 **Every reviewed PR counts, regardless of state** — open, merged, or closed
 without merging. Qodo reviews a PR when it's opened, so limiting the count to
@@ -27,9 +37,9 @@ Qodo reviewed.
 
 ## Why it's fast
 
-It relies entirely on GitHub's search index — the `"Code Review by Qodo"
-in:comments` search qualifier returns exactly the processed PRs, with the
-author attached. So the tool makes one date-chunked search per org and
+It relies entirely on GitHub's search index — the marker `in:comments` search
+qualifier returns exactly the processed PRs, with the author attached. So the
+tool makes one date-chunked search per org and
 **never fetches individual PR bodies, comments, or diffs.** A run over a large
 org is typically seconds-to-minutes.
 
@@ -74,6 +84,9 @@ python3 qodo_usage_metrics.py --org acme-corp --anonymize repos    # repos only
 
 # Count only merged PRs (default counts every reviewed PR, any state)
 python3 qodo_usage_metrics.py --org acme-corp --merged-only
+
+# Override the review heading(s) matched (default: both Qodo headings)
+python3 qodo_usage_metrics.py --org acme-corp --marker "Code Review by Qodo"
 ```
 
 ### Options
@@ -86,6 +99,7 @@ python3 qodo_usage_metrics.py --org acme-corp --merged-only
 | `--until` | End date `YYYY-MM-DD` (inclusive; defaults to today), on PR **creation** date. |
 | `--repos` | Limit to specific repos — only valid with a single `--org`. |
 | `--merged-only` | Count only merged PRs. Default counts every reviewed PR regardless of state (open/merged/closed). |
+| `--marker` | Comment heading(s) identifying a Qodo review. Default: `"Code Review by Qodo"` and `"PR Reviewer Guide"`. A PR counts if any given marker appears in its comments. Override for a deployment that writes a different heading. |
 | `--by {month,week}` | Also emit a timeframe breakout — processed PRs and unique users per period (bucketed by creation date; weeks start Monday). |
 | `--chunk-days` | **Initial** date-window size per search query (default: `30`). Any window that exceeds GitHub's 1000-result search cap is split in half and re-searched automatically, so this only affects performance, not completeness. |
 | `--anonymize [SCOPE]` | Replace identifying data with stable pseudonyms. `SCOPE`: `users`, `repos`, or omit for both. Anonymized repos also drop the PR URL. |
