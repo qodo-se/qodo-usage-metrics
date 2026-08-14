@@ -107,7 +107,7 @@ def test_run_gh_secondary_gives_up_loudly(monkeypatch):
 
 def test_run_gh_primary_waits_until_reset(monkeypatch):
     # Primary limit: wait to the GraphQL bucket reset (here ~30s out), then retry.
-    now = int(__import__("time").time())
+    now = 1_700_000_000
     slept, _ = _install_fake_gh(monkeypatch, [
         _Result(1, stderr="API rate limit exceeded"),
         _Result(0, stdout="done"),
@@ -118,7 +118,7 @@ def test_run_gh_primary_waits_until_reset(monkeypatch):
 
 def test_run_gh_primary_exits_when_reset_far_away(monkeypatch):
     # A reset beyond the cap must exit loudly rather than sleep in silence.
-    now = int(__import__("time").time())
+    now = 1_700_000_000
     _install_fake_gh(monkeypatch, [
         _Result(1, stderr="API rate limit exceeded"),
     ], reset_epoch=now + qum._PRIMARY_WAIT_CAP_S + 500)
