@@ -78,6 +78,12 @@ _TRANSIENT_HTTP = re.compile(r"HTTP 5\d\d|stream error.*(?:CANCEL|INTERNAL_ERROR
 
 UNKNOWN_USER = "(unknown)"
 
+# GitHub's Search API returns at most this many results for any single query,
+# no matter how you paginate. A date window with more matches than this is
+# truncated, so the tool splits such a window in half and re-searches each side
+# until every sub-window is under the cap (see search_processed_prs).
+SEARCH_RESULT_CAP = 1000
+
 
 # --------------------------------------------------------------------------- #
 # gh transport
@@ -169,68 +175,102 @@ def search_processed_prs(
 
     The window filters on PR *creation* date (`created:`), which every PR has —
     unlike merge date, which unmerged PRs lack. Each PR is yielded at most once
-    even if it matches multiple search chunks.
+    even if it matches multiple search windows.
 
-    GitHub's Search API caps any single query at 1000 results; the run is
-    date-chunked to stay under that, and a warning is printed if a chunk still
-    hits the cap.
+    GitHub's Search API caps any single query at SEARCH_RESULT_CAP (1000)
+    results. `chunk_days` sets the *initial* window size, but a window whose
+    match count still exceeds the cap is **automatically split in half and
+    re-searched**, recursively, until every sub-window is under the cap — so the
+    count is complete regardless of `chunk_days`. The only irreducible case is a
+    single calendar day with more than 1000 reviewed PRs (which date-chunking
+    can't split further); that alone prints a loud warning.
     """
     qualifiers = [f"repo:{org}/{r}" for r in repos] if repos else [f"org:{org}"]
     end = until if until is not None else date.today()
     merged_qual = "is:merged " if merged_only else ""
     seen = set()
+
+    def _row(node: dict) -> Optional[dict]:
+        """Turn a raw PR node into a row, deduping by PR. None if not-a-PR or seen."""
+        if not node.get("number"):
+            return None  # non-PR hit from the shared issue index
+        owner, repo = node["repository"]["nameWithOwner"].split("/", 1)
+        key = (owner, repo, node["number"])
+        if key in seen:
+            return None
+        seen.add(key)
+        return {
+            "org": owner,
+            "repo": repo,
+            "pr_number": node["number"],
+            "pr_url": node.get("url", ""),
+            "state": (node.get("state") or "").lower(),
+            "user": (node.get("author") or {}).get("login") or UNKNOWN_USER,
+            "created_at": node.get("createdAt", ""),
+            "merged_at": node.get("mergedAt", ""),
+        }
+
+    def _search_window(qual: str, qual_label: str, w_start: date, w_end: date,
+                       depth: int) -> Iterator[dict]:
+        """Yield rows for one date window, auto-splitting if it hits the cap."""
+        indent = "  " + "  " * depth
+        q = (
+            f'{qual} is:pr {merged_qual}"{QODO_MARKER}" in:comments '
+            f"created:{w_start.isoformat()}..{w_end.isoformat()}"
+        )
+        # Fetch page one first, purely to learn the true total match count
+        # (issueCount is the real total, not capped at 1000). If the window is
+        # over the cap we split instead of yielding a truncated slice, so we
+        # discard this page's nodes here — they reappear, complete, in the
+        # sub-windows (and `seen` would dedup them regardless).
+        gh_args = ["api", "graphql", "-f", f"query={_GQL_SEARCH_QUERY}",
+                   "-f", f"q={q}", "-F", "cursor=null"]
+        search = json.loads(run_gh(gh_args))["data"]["search"]
+        issue_count = search.get("issueCount", 0)
+
+        if issue_count > SEARCH_RESULT_CAP and w_start < w_end:
+            print(f"{indent}Searching {qual_label}  {w_start} .. {w_end} ... "
+                  f"{issue_count} hits > {SEARCH_RESULT_CAP} cap — splitting",
+                  file=sys.stderr, flush=True)
+            mid = w_start + timedelta(days=(w_end - w_start).days // 2)
+            yield from _search_window(qual, qual_label, w_start, mid, depth + 1)
+            yield from _search_window(qual, qual_label, mid + timedelta(days=1),
+                                      w_end, depth + 1)
+            return
+
+        print(f"{indent}Searching {qual_label}  {w_start} .. {w_end} ...",
+              end="", file=sys.stderr, flush=True)
+        count = 0
+        while True:
+            for node in search["nodes"]:
+                row = _row(node)
+                if row is not None:
+                    count += 1
+                    yield row
+            if not search["pageInfo"]["hasNextPage"]:
+                break
+            end_cursor = search["pageInfo"]["endCursor"]
+            gh_args = ["api", "graphql", "-f", f"query={_GQL_SEARCH_QUERY}",
+                       "-f", f"q={q}", "-f", f"cursor={end_cursor}"]
+            search = json.loads(run_gh(gh_args))["data"]["search"]
+        print(f" {count} PRs", file=sys.stderr)
+        if issue_count > SEARCH_RESULT_CAP:
+            # A single day still over the cap: date-chunking can't split further.
+            # (Exactly SEARCH_RESULT_CAP is fine — those results are all
+            # retrievable; only a strictly larger total truncates.) This is the
+            # one residual undercount, so fail loudly rather than quietly
+            # returning a truncated slice.
+            print(f"{indent}Warning: {w_start} alone has {issue_count} matches "
+                  f"(> {SEARCH_RESULT_CAP} cap) for {qual_label}; a single day "
+                  f"can't be split further, so some PRs are missing from it.",
+                  file=sys.stderr)
+
     cursor = since
     while cursor <= end:
         chunk_end = min(cursor + timedelta(days=chunk_days), end)
         for qual in qualifiers:
             qual_label = qual.split(":", 1)[1]
-            print(f"  Searching {qual_label}  {cursor} .. {chunk_end} ...",
-                  end="", file=sys.stderr, flush=True)
-            q = (
-                f'{qual} is:pr {merged_qual}"{QODO_MARKER}" in:comments '
-                f"created:{cursor.isoformat()}..{chunk_end.isoformat()}"
-            )
-            end_cursor = None
-            chunk_count = 0
-            issue_count = 0
-            while True:
-                gh_args = ["api", "graphql", "-f", f"query={_GQL_SEARCH_QUERY}",
-                           "-f", f"q={q}"]
-                if end_cursor:
-                    gh_args += ["-f", f"cursor={end_cursor}"]
-                else:
-                    gh_args += ["-F", "cursor=null"]
-                data = json.loads(run_gh(gh_args))
-                search = data["data"]["search"]
-                issue_count = search.get("issueCount", 0)
-                for node in search["nodes"]:
-                    if not node.get("number"):
-                        continue  # non-PR hit from the shared issue index
-                    owner, repo = node["repository"]["nameWithOwner"].split("/", 1)
-                    key = (owner, repo, node["number"])
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    chunk_count += 1
-                    yield {
-                        "org": owner,
-                        "repo": repo,
-                        "pr_number": node["number"],
-                        "pr_url": node.get("url", ""),
-                        "state": (node.get("state") or "").lower(),
-                        "user": (node.get("author") or {}).get("login") or UNKNOWN_USER,
-                        "created_at": node.get("createdAt", ""),
-                        "merged_at": node.get("mergedAt", ""),
-                    }
-                if not search["pageInfo"]["hasNextPage"]:
-                    break
-                end_cursor = search["pageInfo"]["endCursor"]
-            print(f" {chunk_count} PRs", file=sys.stderr)
-            if issue_count > chunk_count and issue_count >= 1000:
-                print(f"  Warning: search cap hit for {cursor}..{chunk_end} "
-                      f"({qual_label}): {chunk_count}/{issue_count} — some PRs may be "
-                      f"missing. Re-run with a smaller --chunk-days.",
-                      file=sys.stderr)
+            yield from _search_window(qual, qual_label, cursor, chunk_end, 0)
         cursor = chunk_end + timedelta(days=1)
 
 
@@ -509,8 +549,10 @@ def main():
     p.add_argument("--repos", nargs="+", metavar="REPO",
                    help="Limit to specific repos (only valid with a single --org)")
     p.add_argument("--chunk-days", type=int, default=30, metavar="N",
-                   help="Date-window size per search query (default: 30). "
-                        "Lower it if a run warns the 1000-result search cap was hit.")
+                   help="Initial date-window size per search query (default: 30). "
+                        "Windows over GitHub's 1000-result cap are split "
+                        "automatically, so this only tunes performance, not "
+                        "completeness.")
     p.add_argument("--merged-only", action="store_true",
                    help="Count only merged PRs. Default counts every PR Qodo "
                         "reviewed regardless of state (open/merged/closed).")
@@ -521,7 +563,7 @@ def main():
                         "Output filenames get an _anon suffix.")
     p.add_argument("--by", choices=["month", "week"], default=None, metavar="PERIOD",
                    help="Also emit a timeframe breakout of processed PRs and unique "
-                        "users per PERIOD ('month' or 'week', bucketed by merge date).")
+                        "users per PERIOD ('month' or 'week', bucketed by creation date).")
     p.add_argument("--output-dir", type=Path, default=REPORTS_DIR, metavar="DIR",
                    help="Directory to write CSVs into (default: reports/)")
     args = p.parse_args()
