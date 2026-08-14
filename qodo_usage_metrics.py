@@ -2,18 +2,18 @@
 """
 Count Qodo-processed pull requests per user.
 
-A PR is "processed" if Qodo reviewed it — i.e. it carries at least one
-"Code Review by Qodo" comment. Qodo may review a single PR more than once
-(e.g. on each push); this tool counts each PR exactly once regardless of how
-many Qodo reviews it received.
+A PR is "processed" if Qodo reviewed it — i.e. its comments carry a Qodo review
+heading (e.g. "Code Review by Qodo" or "PR Reviewer Guide"). Qodo may review a
+single PR more than once (e.g. on each push); this tool counts each PR exactly
+once regardless of how many Qodo reviews it received.
 
 It answers one question: how many PRs did Qodo process, per user, and how many
 unique users is that?
 
-It works entirely from GitHub's search index (the `"Code Review by Qodo"
-in:comments` qualifier), so it makes one date-chunked search per org and never
-fetches individual PR bodies. Authentication is handled by the `gh` CLI — just
-make sure `gh auth status` shows you logged in with access to the org's repos.
+It works entirely from GitHub's search index (a Qodo review marker matched
+`in:comments`), so it makes one date-chunked search per org and never fetches
+individual PR bodies. Authentication is handled by the `gh` CLI — just make sure
+`gh auth status` shows you logged in with access to the org's repos.
 
 Output: CSV files only, written into ./reports/ (created automatically).
 
@@ -52,9 +52,29 @@ from typing import Dict, Iterable, Iterator, List, Optional
 
 REPORTS_DIR = Path("reports")
 
-# The stable marker Qodo writes into its review comment. Bot account names vary
-# between deployments, so we match on this string rather than an account login.
-QODO_MARKER = "Code Review by Qodo"
+# Stable phrases Qodo writes as the heading of its PR review comment. Bot account
+# names vary between deployments, so we match on comment text rather than an
+# account login. Qodo's review surfaces use different headings:
+#   - "Code Review by Qodo" — the newer agentic / Qodo Merge review
+#   - "PR Reviewer Guide"   — the classic Qodo Merge / PR-Agent `/review` output
+# A PR counts if ANY marker appears in its comments (the markers are unioned into
+# one search and the PR is de-duped), so the number reflects reviews from either
+# surface. Deployments whose heading differs can override the set with --marker.
+DEFAULT_QODO_MARKERS = ("Code Review by Qodo", "PR Reviewer Guide")
+
+
+def markers_qualifier(markers: List[str]) -> str:
+    """Build the search term matching any of `markers` in a PR's comments.
+
+    One quoted phrase for a single marker; a parenthesised `OR` group for
+    several. GitHub unions the phrases within one query (verified to equal the
+    union of the per-marker result counts), so a single search returns PRs
+    carrying any marker and the searcher then de-dupes by PR.
+    """
+    quoted = [f'"{m}"' for m in markers]
+    if len(quoted) == 1:
+        return f"{quoted[0]} in:comments"
+    return f'({" OR ".join(quoted)}) in:comments'
 
 # GraphQL search returning only the fields the slim report needs.
 _GQL_SEARCH_QUERY = (
@@ -76,6 +96,42 @@ _GQL_SEARCH_QUERY = (
 # CANCEL/INTERNAL_ERROR frames emitted by GitHub's edge on expensive queries.
 _TRANSIENT_HTTP = re.compile(r"HTTP 5\d\d|stream error.*(?:CANCEL|INTERNAL_ERROR)")
 
+# GitHub throttles in two unrelated ways that need opposite handling:
+#   * primary   — the GraphQL point quota is exhausted; the only cure is to wait
+#                 until the bucket resets (a fixed time, not a guess).
+#   * secondary — an anti-abuse / request-velocity limit; GitHub's guidance is to
+#                 back off "at least one minute" and grow exponentially from there.
+# Secondary messages also contain the substring "rate limit", so they must be
+# tested first. See classify_rate_limit / run_gh.
+_SECONDARY_RATE_LIMIT = re.compile(
+    r"secondary rate limit|exceeded a secondary|abuse detection|"
+    r"you have triggered|retry your request|submitted too quickly", re.I)
+_PRIMARY_RATE_LIMIT = re.compile(r"rate limit", re.I)
+
+# Retry tuning.
+_REQUEST_SPACING_S = 0.5        # preventive pause before each gh call (velocity)
+_MAX_TRANSIENT_RETRIES = 3      # timeouts + HTTP 5xx / stream errors: 5s,15s,45s
+_MAX_PRIMARY_RETRIES = 3        # quota-reset waits
+_MAX_SECONDARY_RETRIES = 5      # anti-abuse backoffs
+_SECONDARY_BACKOFF_BASE_S = 60  # GitHub's documented floor for secondary limits
+_SECONDARY_BACKOFF_CAP_S = 300  # never sleep more than this on one backoff
+_PRIMARY_WAIT_CAP_S = 900       # beyond this, exit loudly rather than sleep silently
+
+
+def classify_rate_limit(stderr: str) -> Optional[str]:
+    """Classify a gh stderr string as a 'secondary', 'primary', or non-rate error.
+
+    Returns 'secondary', 'primary', or None. Secondary (anti-abuse) messages also
+    contain "rate limit", so they are matched first; the two need opposite
+    handling (backoff vs wait-to-reset), so distinguishing them matters.
+    """
+    if _SECONDARY_RATE_LIMIT.search(stderr):
+        return "secondary"
+    if _PRIMARY_RATE_LIMIT.search(stderr):
+        return "primary"
+    return None
+
+
 UNKNOWN_USER = "(unknown)"
 
 # GitHub's Search API returns at most this many results for any single query,
@@ -89,11 +145,16 @@ SEARCH_RESULT_CAP = 1000
 # gh transport
 # --------------------------------------------------------------------------- #
 
-def _rate_limit_reset_epoch() -> Optional[int]:
-    """Return the Unix timestamp when the GitHub search rate limit resets."""
+def _rate_limit_reset_epoch(resource: str = "graphql") -> Optional[int]:
+    """Return the Unix timestamp when the given GitHub rate-limit bucket resets.
+
+    Defaults to the `graphql` bucket because every search this tool makes goes
+    through the GraphQL API — the REST `search` bucket is a different, unrelated
+    quota. Querying `/rate_limit` does not itself consume any quota.
+    """
     try:
         out = subprocess.run(
-            ["gh", "api", "rate_limit", "--jq", ".resources.search.reset"],
+            ["gh", "api", "rate_limit", "--jq", f".resources.{resource}.reset"],
             capture_output=True, text=True, timeout=15,
         )
         return int(out.stdout.strip())
@@ -102,51 +163,83 @@ def _rate_limit_reset_epoch() -> Optional[int]:
 
 
 def run_gh(args: List[str]) -> str:
-    """Run `gh` and return stdout, retrying on rate limits and transient HTTP errors.
+    """Run `gh` and return stdout, retrying on rate limits and transient errors.
 
-    Exits the process on a hard (non-transient) failure, so a broken run fails
-    loudly rather than producing a partial report.
+    Three failure modes, three treatments (see the module constants):
+      * transient (timeout, HTTP 5xx, HTTP/2 stream CANCEL/INTERNAL_ERROR):
+        short exponential backoff (5s/15s/45s), then give up loudly.
+      * primary rate limit (GraphQL quota exhausted): wait until the GraphQL
+        bucket resets — capped, so an hour-away reset exits loudly with the reset
+        time instead of sleeping in silence.
+      * secondary rate limit (anti-abuse / velocity): exponential backoff from
+        GitHub's documented 60s floor (60s/120s/240s…), capped per wait. GitHub
+        may send a Retry-After header here, but `gh api` does not surface
+        response headers, so we fall back to backoff.
+
+    A small pre-request pause paces successive calls to avoid tripping the
+    velocity-based secondary limit in the first place. Exits the process on a
+    hard failure or once a retry budget is exhausted, so a broken run fails
+    loudly rather than emitting a partial report.
     """
     cmd = ["gh"] + args
-    rate_retried = False
-    # One retry budget shared by timeouts and transient HTTP failures — by
-    # design: it caps total backoff (~5s+15s+45s) so a flaky link fails loudly
-    # rather than blocking indefinitely, per this function's contract.
-    http_retries = 0
-    max_http_retries = 3
+    transient_retries = 0
+    primary_retries = 0
+    secondary_retries = 0
     while True:
+        if _REQUEST_SPACING_S:
+            time.sleep(_REQUEST_SPACING_S)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True,
                                     encoding="utf-8", timeout=120)
         except subprocess.TimeoutExpired:
             # A hung request is a transient failure like a 5xx — retry on the
             # same backoff, then give up loudly rather than blocking forever.
-            if http_retries < max_http_retries:
-                http_retries += 1
-                wait = 5 * (3 ** (http_retries - 1))  # 5s, 15s, 45s
+            if transient_retries < _MAX_TRANSIENT_RETRIES:
+                transient_retries += 1
+                wait = 5 * (3 ** (transient_retries - 1))  # 5s, 15s, 45s
                 print(f"\n  request timed out — retrying in {wait}s "
-                      f"({http_retries}/{max_http_retries})...",
+                      f"({transient_retries}/{_MAX_TRANSIENT_RETRIES})...",
                       file=sys.stderr, flush=True)
                 time.sleep(wait)
                 continue
-            sys.exit(f"`{' '.join(cmd)}` timed out after {max_http_retries} retries")
+            sys.exit(f"`{' '.join(cmd)}` timed out after {_MAX_TRANSIENT_RETRIES} retries")
         if result.returncode == 0:
             return result.stdout
         stderr = result.stderr
-        if "rate limit" in stderr.lower() and not rate_retried:
-            rate_retried = True
-            reset = _rate_limit_reset_epoch()
-            wait = max(0, reset - int(time.time())) + 5 if reset else 60
-            print(f"\n  Rate limit hit — waiting {wait}s before retry...",
+
+        kind = classify_rate_limit(stderr)
+        if kind == "primary" and primary_retries < _MAX_PRIMARY_RETRIES:
+            primary_retries += 1
+            reset = _rate_limit_reset_epoch("graphql")
+            if reset:
+                wait = max(0, reset - int(time.time())) + 5
+                if wait > _PRIMARY_WAIT_CAP_S:
+                    when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset))
+                    sys.exit(f"GitHub GraphQL rate limit exhausted; it resets at "
+                             f"{when} (~{wait}s away). Re-run after that.")
+            else:
+                wait = _SECONDARY_BACKOFF_BASE_S
+            print(f"\n  Primary rate limit hit — waiting {wait}s for the GraphQL "
+                  f"quota to reset ({primary_retries}/{_MAX_PRIMARY_RETRIES})...",
                   file=sys.stderr, flush=True)
             time.sleep(wait)
             continue
+        if kind == "secondary" and secondary_retries < _MAX_SECONDARY_RETRIES:
+            secondary_retries += 1
+            wait = min(_SECONDARY_BACKOFF_BASE_S * (2 ** (secondary_retries - 1)),
+                       _SECONDARY_BACKOFF_CAP_S)
+            print(f"\n  Secondary rate limit hit — backing off {wait}s "
+                  f"({secondary_retries}/{_MAX_SECONDARY_RETRIES})...",
+                  file=sys.stderr, flush=True)
+            time.sleep(wait)
+            continue
+
         m = _TRANSIENT_HTTP.search(stderr)
-        if m and http_retries < max_http_retries:
-            http_retries += 1
-            wait = 5 * (3 ** (http_retries - 1))  # 5s, 15s, 45s
+        if m and transient_retries < _MAX_TRANSIENT_RETRIES:
+            transient_retries += 1
+            wait = 5 * (3 ** (transient_retries - 1))  # 5s, 15s, 45s
             print(f"\n  {m.group()} — retrying in {wait}s "
-                  f"({http_retries}/{max_http_retries})...",
+                  f"({transient_retries}/{_MAX_TRANSIENT_RETRIES})...",
                   file=sys.stderr, flush=True)
             time.sleep(wait)
             continue
@@ -164,11 +257,13 @@ def search_processed_prs(
     repos: Optional[List[str]] = None,
     chunk_days: int = 30,
     merged_only: bool = False,
+    markers: Optional[List[str]] = None,
 ) -> Iterator[dict]:
     """Yield one dict per Qodo-processed PR created in [since, until] for `org`.
 
-    A PR is "processed" if Qodo reviewed it — the `"Code Review by Qodo"
-    in:comments` qualifier returns exactly those, no per-PR fetch required. By
+    A PR is "processed" if Qodo reviewed it — a `<marker> in:comments` qualifier
+    returns exactly those, no per-PR fetch required. `markers` defaults to
+    DEFAULT_QODO_MARKERS and a PR matching any of them counts once. By
     default every reviewed PR is yielded regardless of state (open, merged, or
     closed-unmerged) so the unique-user count reflects everyone Qodo reviewed;
     pass `merged_only=True` to restrict to merged PRs.
@@ -188,6 +283,7 @@ def search_processed_prs(
     qualifiers = [f"repo:{org}/{r}" for r in repos] if repos else [f"org:{org}"]
     end = until if until is not None else date.today()
     merged_qual = "is:merged " if merged_only else ""
+    marker_qual = markers_qualifier(list(markers) if markers else list(DEFAULT_QODO_MARKERS))
     seen = set()
 
     def _row(node: dict) -> Optional[dict]:
@@ -215,7 +311,7 @@ def search_processed_prs(
         """Yield rows for one date window, auto-splitting if it hits the cap."""
         indent = "  " + "  " * depth
         q = (
-            f'{qual} is:pr {merged_qual}"{QODO_MARKER}" in:comments '
+            f'{qual} is:pr {merged_qual}{marker_qual} '
             f"created:{w_start.isoformat()}..{w_end.isoformat()}"
         )
         # Fetch page one first, purely to learn the true total match count
@@ -556,6 +652,12 @@ def main():
     p.add_argument("--merged-only", action="store_true",
                    help="Count only merged PRs. Default counts every PR Qodo "
                         "reviewed regardless of state (open/merged/closed).")
+    p.add_argument("--marker", nargs="+", metavar="TEXT", default=None,
+                   help="Comment heading(s) that identify a Qodo review; a PR "
+                        "counts if any appears in its comments. Default: "
+                        + " and ".join(f'\"{m}\"' for m in DEFAULT_QODO_MARKERS)
+                        + ". Override if your Qodo deployment writes a different "
+                          "heading.")
     p.add_argument("--anonymize", nargs="?", const="all", default=None,
                    choices=["all", "users", "repos"], metavar="SCOPE",
                    help="Replace identifying data with stable pseudonyms. "
@@ -582,6 +684,8 @@ def main():
     if since > until:
         p.error(f"--since ({since}) is after --until ({until})")
 
+    markers = list(dict.fromkeys(args.marker)) if args.marker else list(DEFAULT_QODO_MARKERS)
+
     validate_orgs(orgs, args.repos)
     check_token_scope()
 
@@ -590,7 +694,7 @@ def main():
         print(f"\nOrg: {org}", file=sys.stderr)
         rows.extend(search_processed_prs(
             org, since, until, repos=args.repos, chunk_days=args.chunk_days,
-            merged_only=args.merged_only))
+            merged_only=args.merged_only, markers=markers))
 
     if args.anonymize:
         user_map, org_map, repo_map = build_anon_maps(rows, args.anonymize)
@@ -603,6 +707,7 @@ def main():
     print()
     print(f"Window (by PR creation date): {since} → {until}")
     print(f"Orgs:              {', '.join(orgs)}")
+    print(f"Markers:           {', '.join(markers)}")
     print(f"Scope:             {'merged PRs only' if args.merged_only else 'all reviewed PRs (any state)'}")
     print(f"Processed PRs:     {len(rows)}")
     print(f"Unique users:      {len(by_user)}")
@@ -621,8 +726,9 @@ def main():
               "    - wrong --org (typo) or no access to its private repos\n"
               "    - gh token missing the 'repo' scope (see any warning above)\n"
               "    - the window (--since / --until / --days) has no reviewed PRs\n"
-              f"    - this Qodo deployment's review header differs from "
-              f"'{QODO_MARKER}'", file=sys.stderr)
+              f"    - this Qodo deployment's review heading isn't one of "
+              f"{', '.join(repr(m) for m in markers)} (override with --marker)",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":
